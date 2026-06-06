@@ -17,16 +17,18 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # ----- 1. System packages -----
 # We only need ALSA + numpy linkers + tzdata.  No GStreamer (audio-only),
 # no opencv, no torchvision deps.
+# tegrastats is shipped with the L4T BSP at /usr/bin/tegrastats — not an
+# apt package on its own.  The base l4t-jetpack image already has it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-pip python3-dev python3-setuptools python3-wheel \
         libopenblas0-pthread libsndfile1 \
         alsa-utils libasound2-plugins \
-        tegrastats-tools tzdata ca-certificates curl \
-    && rm -rf /var/lib/apt/lists/* || true
+        tzdata ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
 
-# Older base images don't have tegrastats-tools as a separate package
-# (the binary ships with L4T BSP).  Fall back gracefully.
-RUN test -x /usr/bin/tegrastats || true
+# Sanity: confirm tegrastats is on PATH so the dashboard's sys monitor works.
+RUN command -v tegrastats >/dev/null 2>&1 \
+    || echo "WARN: tegrastats not in image — sys monitor will be empty"
 
 # ----- 2. Python deps (split for layer cache) -----
 # numpy first so pandas/scipy etc compile against a known version
