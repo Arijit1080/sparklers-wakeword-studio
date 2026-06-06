@@ -59,17 +59,135 @@ docker run -d --name sparklers-ww \
   ghcr.io/Arijit1080/sparklers-wakeword-studio:latest
 ```
 
-### Option C — Bare metal (no Docker)
+### Option C — Bare metal (no Docker) — full step-by-step
+
+If you'd rather not run a container, here's everything from a fresh JetPack 6.2 install. About 15 minutes of active work (most of it pip waiting).
+
+#### 1. Plug in the USB audio codec and verify the mic
 
 ```bash
-git clone https://github.com/Arijit1080/sparklers-wakeword-studio.git
-cd sparklers-wakeword-studio
+arecord -l
+# Should list:
+#   card 0: Device [USB PnP Audio Device], device 0: USB Audio [USB Audio]
+```
+
+If `card 0` isn't your USB device, find its number from `arecord -l` and use that as the device throughout. A quick capture test:
+
+```bash
+arecord -D plughw:0,0 -r 16000 -f S16_LE -c 1 -d 3 /tmp/test.wav && aplay /tmp/test.wav
+```
+
+If the recording is very quiet, the mic gain may be low. Boost it once and persist:
+
+```bash
+amixer -c 0 sset 'Mic' 100%        # capture gain to max (~31 dB)
+amixer -c 0 sset 'Speaker' 100%    # playback (for the cue beeps)
+sudo alsactl store 0               # persist across reboots
+```
+
+(Optional) Make the codec the default ALSA device so apps don't need explicit routing:
+
+```bash
+cat > ~/.asoundrc <<'EOF'
+pcm.!default { type asym  capture.pcm "hw:0,0"  playback.pcm "plughw:0,0" }
+ctl.!default { type hw  card 0 }
+EOF
+```
+
+#### 2. Clone the repo
+
+```bash
+git clone https://github.com/Arijit1080/sparklers-wakeword-studio.git ~/sparklers-wakeword-studio
+cd ~/sparklers-wakeword-studio
+```
+
+#### 3. Create a venv and pin numpy
+
+We use `--system-site-packages` so the venv inherits JetPack's system numpy/scipy (and CUDA libs if we ever need them). **The numpy 1.x line is required** — many ML wheels for JetPack still link against numpy 1.x ABI, and mixing with numpy 2.x produces the dreaded "Expected 96 from C header, got 88" crashes.
+
+```bash
 python3 -m venv --system-site-packages venv
 source venv/bin/activate
-pip install -r requirements.txt
-python3 tools/download_voices.py    # ~377 MB of Piper voices, one-time
+pip install --upgrade pip
+pip install 'numpy<2'
+```
+
+#### 4. Install the Python stack
+
+```bash
+# Core data libs (pinned to versions known to work with numpy 1.x + py3.10)
+pip install 'scipy>=1.11,<1.15' 'scikit-learn>=1.3,<1.6' 'pandas<2.2' joblib
+
+# Audio I/O + ONNX runtime + OpenWakeWord
+pip install sounddevice onnxruntime openwakeword piper-tts
+
+# Web stack
+pip install fastapi 'uvicorn[standard]' jinja2 python-multipart rich
+```
+
+If the venv complains that `pandas` is 2.x and incompatible, force-reinstall pandas in the venv to override the system one:
+
+```bash
+pip install --force-reinstall --no-deps 'pandas<2.2'
+```
+
+#### 5. Download OWW pretrained models + Piper voices
+
+```bash
+# OWW pretrained mel + embedding ONNX + 6 keyword classifiers (~10 MB)
+python3 -c "import openwakeword; openwakeword.utils.download_models()"
+
+# 6 Piper TTS voices used as training-data speakers (~377 MB, one-time)
+python3 tools/download_voices.py
+```
+
+#### 6. Sanity-check the audio pipeline
+
+```bash
+python3 -c "
+import sys; sys.path.insert(0, '.')
+from audio.mic import find_usb_codec_index, list_input_devices
+print('USB codec at input index:', find_usb_codec_index())
+print('all inputs:', [d['name'] for d in list_input_devices()][:3])
+"
+```
+
+Expected output: `USB codec at input index: 0`.
+
+#### 7. Run the web UI
+
+```bash
 uvicorn web.app:app --host 0.0.0.0 --port 8082
 ```
+
+Open `http://<jetson-ip>:8082` in any browser on the same network. Train a custom keyword, listen on the dashboard — same as the Docker flow.
+
+#### 8. (Optional) Run as a systemd service
+
+```bash
+sudo tee /etc/systemd/system/sparklers-ww.service > /dev/null <<EOF
+[Unit]
+Description=Sparklers Wakeword Studio
+After=network-online.target sound.target
+
+[Service]
+Type=simple
+User=$USER
+WorkingDirectory=$HOME/sparklers-wakeword-studio
+ExecStart=$HOME/sparklers-wakeword-studio/venv/bin/uvicorn web.app:app --host 0.0.0.0 --port 8082
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now sparklers-ww
+journalctl -u sparklers-ww -f
+```
+
+Now it survives reboots and you can manage it like any other Linux service.
 
 ---
 
