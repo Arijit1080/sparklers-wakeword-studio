@@ -24,8 +24,11 @@ services:
     group_add:
       - audio
 
-    # tegrastats needs to read host /sys files.  Mount read-only.
+    # tegrastats binary + the /sys it reads come from the host BSP, not
+    # from any apt package.  Bind-mount them so the dashboard's CPU/GPU/
+    # RAM/temps panel works inside the container.
     volumes:
+      - /usr/bin/tegrastats:/usr/bin/tegrastats:ro
       - /sys:/sys:ro
       - sparklers_ww_data:/app/data
       - sparklers_ww_models:/app/models

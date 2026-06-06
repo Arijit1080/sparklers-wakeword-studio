@@ -22,7 +22,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-pip python3-dev python3-setuptools python3-wheel \
         libopenblas0-pthread libsndfile1 \
-        alsa-utils libasound2-plugins \
+        alsa-utils libasound2-plugins libportaudio2 \
         tzdata ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
