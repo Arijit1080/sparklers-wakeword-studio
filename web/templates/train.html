@@ -1,0 +1,138 @@
+{% extends "_base.html" %}
+{% block title %}Sparklers Wakeword Studio — train{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>Train a new wakeword</h1>
+  <p class="lede">Generates ~780 synthetic samples in ~6 voices using Piper TTS,
+    extracts features with OpenWakeWord, fits a logistic regression
+    classifier, evaluates, and saves a <code>.joblib</code> model.  Total
+    ~6–10 minutes depending on disk + CPU.</p>
+
+  <form id="train-form" class="form-grid">
+    <label>Keyword
+      <input type="text" name="keyword" required pattern="[A-Za-z][A-Za-z0-9 ]*"
+             placeholder="e.g. Arijit" autofocus>
+      <small class="muted">3+ syllables work best.  Letters only.</small>
+    </label>
+    <div class="settings-grid">
+      <label>Positives per voice
+        <input type="number" name="n_per_voice" value="50" min="20" max="200">
+      </label>
+      <label>Negatives per voice
+        <input type="number" name="neg_per_voice" value="80" min="20" max="200">
+      </label>
+    </div>
+    <button type="submit" id="train-btn" class="btn primary big">▶ Start training</button>
+  </form>
+</section>
+
+<section id="prog-card" class="card hidden">
+  <h2 id="phase-label">Training…</h2>
+  <p id="phase-text" class="lede"></p>
+  <div class="meter big">
+    <div id="prog-bar"></div>
+  </div>
+  <div class="kv">
+    <div><strong id="phase-now">—</strong><span>phase</span></div>
+    <div><strong id="pct-now">0%</strong><span>progress</span></div>
+  </div>
+</section>
+
+<section id="result-card" class="card hidden">
+  <h2>✓ Training complete</h2>
+  <div class="kv">
+    <div><strong id="r-keyword">—</strong><span>keyword</span></div>
+    <div><strong id="r-auc">—</strong><span>eval AUC</span></div>
+    <div><strong id="r-thr">—</strong><span>threshold</span></div>
+    <div><strong id="r-f1">—</strong><span>eval F1</span></div>
+  </div>
+  <div class="row" style="margin-top:14px">
+    <a href="/" class="btn primary">→ Pick models &amp; listen</a>
+    <a href="/train" class="btn">+ Train another</a>
+  </div>
+</section>
+
+<section class="card subtle">
+  <h3>Existing custom models</h3>
+  <ul>
+    {% for m in models if m.source == 'custom' %}
+    <li><strong>{{ m.key }}</strong>
+      {% if m.auc %} · AUC {{ '%.3f' % m.auc }}{% endif %}
+      {% if m.suggested_threshold %} · thr {{ '%.2f' % m.suggested_threshold }}{% endif %}
+      · {{ m.size_kb }} KB
+    </li>
+    {% else %}
+    <li class="muted">none yet — train your first one above.</li>
+    {% endfor %}
+  </ul>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(() => {
+  const form = document.getElementById('train-form');
+  const btn  = document.getElementById('train-btn');
+  const card = document.getElementById('prog-card');
+  const bar  = document.getElementById('prog-bar');
+  const lab  = document.getElementById('phase-label');
+  const txt  = document.getElementById('phase-text');
+  const phaseNow = document.getElementById('phase-now');
+  const pctNow   = document.getElementById('pct-now');
+  const resultCard = document.getElementById('result-card');
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(form);
+    const r = await fetch('/api/train/start', { method: 'POST', body: fd });
+    const j = await r.json();
+    if (!j.ok) { alert(j.error || 'failed'); return; }
+    btn.disabled = true; btn.textContent = 'training…';
+    card.classList.remove('hidden');
+    resultCard.classList.add('hidden');
+    lab.textContent = `Training "${fd.get('keyword')}"…`;
+  });
+
+  const PHASE_LABELS = {
+    starting: 'Starting',
+    voices:   'Downloading voices',
+    synth:    'Generating samples',
+    embed:    'Extracting features',
+    fit:      'Fitting classifier',
+    save:     'Saving model',
+    done:     'Done',
+    error:    'Error',
+  };
+
+  const es = new EventSource('/events');
+  es.addEventListener('status', (e) => {
+    const s = JSON.parse(e.data);
+    if (s.state !== 'training' && s.train_phase !== 'done') return;
+    const phase = s.train_phase || 'starting';
+    const p = Math.max(0, Math.min(1, s.train_progress || 0));
+    bar.style.width = (p * 100).toFixed(1) + '%';
+    pctNow.textContent = (p * 100).toFixed(0) + '%';
+    phaseNow.textContent = PHASE_LABELS[phase] || phase;
+    lab.textContent = `${PHASE_LABELS[phase] || phase} — ${s.train_keyword}`;
+    if (s.train_progress_text) txt.textContent = s.train_progress_text;
+  });
+  es.addEventListener('train_done', (e) => {
+    const d = JSON.parse(e.data);
+    bar.style.width = '100%';
+    pctNow.textContent = '100%';
+    phaseNow.textContent = 'Done';
+    document.getElementById('r-keyword').textContent = d.keyword;
+    document.getElementById('r-auc').textContent = d.auc.toFixed(3);
+    document.getElementById('r-thr').textContent = d.threshold.toFixed(2);
+    document.getElementById('r-f1').textContent  = d.f1.toFixed(3);
+    resultCard.classList.remove('hidden');
+    btn.disabled = false; btn.textContent = '▶ Start training';
+  });
+  es.addEventListener('error', (e) => {
+    try { const d = JSON.parse(e.data); txt.textContent = 'ERROR: ' + d.msg; }
+    catch (_) {}
+    btn.disabled = false; btn.textContent = '▶ Start training';
+  });
+})();
+</script>
+{% endblock %}

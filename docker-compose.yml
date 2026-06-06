@@ -1,0 +1,42 @@
+# Sparklers Wakeword Studio — production compose file.
+#
+# Run with:
+#   docker compose up -d
+#   docker compose logs -f
+#   docker compose down
+#
+# Open the UI at http://<jetson-ip>:8082
+
+services:
+  sparklers-ww:
+    image: ghcr.io/arijit1080/sparklers-wakeword-studio:latest
+    container_name: sparklers-ww
+    hostname: sparklers-ww
+    restart: unless-stopped
+
+    # ALSA — pass through the host's USB audio codec.
+    # /dev/snd contains the ALSA character devices for all sound cards.
+    devices:
+      - /dev/snd:/dev/snd
+
+    # Some ALSA users need access to host audio groups.  Adjust the gid
+    # to match `getent group audio` on your host if needed.
+    group_add:
+      - audio
+
+    # tegrastats needs to read host /sys files.  Mount read-only.
+    volumes:
+      - /sys:/sys:ro
+      - sparklers_ww_data:/app/data
+      - sparklers_ww_models:/app/models
+
+    ports:
+      - "8082:8082"
+
+    stop_grace_period: 10s
+
+volumes:
+  sparklers_ww_data:
+    name: sparklers_ww_data
+  sparklers_ww_models:
+    name: sparklers_ww_models

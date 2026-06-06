@@ -1,0 +1,14 @@
+.git
+.gitignore
+venv/
+__pycache__/
+*.pyc
+data/piper_voices/
+data/train/
+data/captures/
+models/*.joblib
+models/*.onnx
+docs/images/
+README.md
+*.wav
+.DS_Store

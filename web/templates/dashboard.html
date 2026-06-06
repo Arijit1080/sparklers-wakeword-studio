@@ -1,0 +1,210 @@
+{% extends "_base.html" %}
+{% block title %}Sparklers Wakeword Studio — dashboard{% endblock %}
+{% block content %}
+<section class="card">
+  <div class="row between">
+    <h1>Live dashboard</h1>
+    <div class="row">
+      <span id="state-pill" class="pill">{{ status.state }}</span>
+      <button id="stop" class="btn">⏹ Stop</button>
+    </div>
+  </div>
+  <div class="kv">
+    <div><strong id="trig-total">{{ status.n_triggers }}</strong><span>triggers</span></div>
+    <div><strong id="embed-ms">{{ '%.1f' % status.embed_ms_p50 }} ms</strong><span>inference p50</span></div>
+    <div><strong id="thr-now">{{ status.threshold }}</strong><span>threshold</span></div>
+    <div><strong id="vad-now">{{ status.vad_threshold }}</strong><span>VAD</span></div>
+  </div>
+</section>
+
+<section class="card" id="sys-card">
+  <h2>System</h2>
+  <div class="sys-grid">
+    <div class="sys-row">
+      <div class="sys-label">CPU</div>
+      <div class="sys-bar"><div id="sys-cpu-fill" class="sys-fill"></div></div>
+      <div class="sys-val"><strong id="sys-cpu-pct">—</strong>%</div>
+    </div>
+    <div class="sys-row">
+      <div class="sys-label">GPU</div>
+      <div class="sys-bar"><div id="sys-gpu-fill" class="sys-fill gpu"></div></div>
+      <div class="sys-val"><strong id="sys-gpu-pct">—</strong>%</div>
+    </div>
+    <div class="sys-row">
+      <div class="sys-label">RAM</div>
+      <div class="sys-bar"><div id="sys-ram-fill" class="sys-fill ram"></div></div>
+      <div class="sys-val"><strong id="sys-ram-used">—</strong> / <span id="sys-ram-total">—</span> GB</div>
+    </div>
+    <div class="sys-row">
+      <div class="sys-label">Swap</div>
+      <div class="sys-bar"><div id="sys-swap-fill" class="sys-fill ram"></div></div>
+      <div class="sys-val"><strong id="sys-swap-used">—</strong> / <span id="sys-swap-total">—</span> MB</div>
+    </div>
+  </div>
+  <div class="sys-extra">
+    <span>tj <strong id="sys-tj">—</strong>°C</span>
+    <span>cpu <strong id="sys-cpu-temp">—</strong>°C</span>
+    <span>gpu <strong id="sys-gpu-temp">—</strong>°C</span>
+    <span>power <strong id="sys-power">—</strong> W</span>
+    <span id="sys-cores" class="cores"></span>
+  </div>
+</section>
+
+<section class="card">
+  <h2>Live scores</h2>
+  <div id="score-list"></div>
+  <p class="muted" id="top-now">…</p>
+</section>
+
+<section class="card">
+  <h2>Triggers</h2>
+  <ul id="trig-list">
+    {% for t in triggers %}
+    <li>🟢 <span class="time">{{ t.ts }}</span> · <strong>{{ t.key }}</strong> · score {{ '%.3f' % t.score }}</li>
+    {% endfor %}
+  </ul>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(() => {
+  const scoreList = document.getElementById('score-list');
+  const topNow = document.getElementById('top-now');
+  const trigTotal = document.getElementById('trig-total');
+  const trigList = document.getElementById('trig-list');
+  const embedMs  = document.getElementById('embed-ms');
+  const thrNow   = document.getElementById('thr-now');
+  const vadNow   = document.getElementById('vad-now');
+  const statePill = document.getElementById('state-pill');
+  let bars = {};
+  let threshold = parseFloat(thrNow.textContent);
+
+  function rebuildBars(keys) {
+    scoreList.innerHTML = '';
+    bars = {};
+    for (const k of keys) {
+      const row = document.createElement('div');
+      row.className = 'bar-row';
+      row.innerHTML = `
+        <div class="bar-label">${k}</div>
+        <div class="bar-track">
+          <div class="bar-fill" data-key="${k}"></div>
+          <div class="bar-thr"></div>
+        </div>
+        <div class="bar-val" data-key="${k}">0.000</div>`;
+      scoreList.appendChild(row);
+      bars[k] = {
+        fill: row.querySelector('.bar-fill'),
+        val:  row.querySelector('.bar-val'),
+        thr:  row.querySelector('.bar-thr'),
+      };
+    }
+    updateThrLines();
+  }
+
+  function updateThrLines() {
+    Object.values(bars).forEach(b => {
+      b.thr.style.left = (threshold * 100) + '%';
+    });
+  }
+
+  document.getElementById('stop').addEventListener('click', async () => {
+    await fetch('/api/listen/stop', { method: 'POST' });
+    window.location.href = '/';
+  });
+
+  const es = new EventSource('/events');
+
+  es.addEventListener('status', (e) => {
+    const s = JSON.parse(e.data);
+    statePill.textContent = s.state;
+    statePill.className = 'pill ' + s.state;
+    trigTotal.textContent = s.n_triggers || 0;
+    threshold = s.threshold || threshold;
+    thrNow.textContent = threshold.toFixed(2);
+    vadNow.textContent = (s.vad_threshold || 0).toFixed(2);
+    if (s.model_keys && s.model_keys.length) {
+      const haveKeys = Object.keys(bars).sort().join(',');
+      const newKeys  = s.model_keys.slice().sort().join(',');
+      if (haveKeys !== newKeys) rebuildBars(s.model_keys);
+    }
+  });
+
+  es.addEventListener('scores', (e) => {
+    const d = JSON.parse(e.data);
+    if (d.embed_ms) embedMs.textContent = d.embed_ms.toFixed(1) + ' ms';
+    if (d.top_key) topNow.textContent = `${d.top_key} → ${d.top.toFixed(3)}`;
+    for (const k in d.all) {
+      if (!bars[k]) continue;
+      const v = d.all[k];
+      bars[k].fill.style.width = (Math.min(1, Math.max(0, v)) * 100) + '%';
+      bars[k].fill.classList.toggle('hot', v > threshold);
+      bars[k].val.textContent = v.toFixed(3);
+    }
+  });
+
+  es.addEventListener('trigger', (e) => {
+    const d = JSON.parse(e.data);
+    trigTotal.textContent = d.n;
+    const li = document.createElement('li');
+    const t = new Date(d.ts * 1000).toLocaleTimeString();
+    li.innerHTML = `🟢 <span class="time">${t}</span> · <strong>${d.key}</strong> · score ${d.score.toFixed(3)}`;
+    trigList.insertBefore(li, trigList.firstChild);
+    li.classList.add('flash');
+  });
+
+  // ---- system stats panel ----
+  const sysCpuFill = document.getElementById('sys-cpu-fill');
+  const sysGpuFill = document.getElementById('sys-gpu-fill');
+  const sysRamFill = document.getElementById('sys-ram-fill');
+  const sysSwapFill = document.getElementById('sys-swap-fill');
+  const sysCpuPct = document.getElementById('sys-cpu-pct');
+  const sysGpuPct = document.getElementById('sys-gpu-pct');
+  const sysRamUsed = document.getElementById('sys-ram-used');
+  const sysRamTotal = document.getElementById('sys-ram-total');
+  const sysSwapUsed = document.getElementById('sys-swap-used');
+  const sysSwapTotal = document.getElementById('sys-swap-total');
+  const sysTj = document.getElementById('sys-tj');
+  const sysCpuTemp = document.getElementById('sys-cpu-temp');
+  const sysGpuTemp = document.getElementById('sys-gpu-temp');
+  const sysPower = document.getElementById('sys-power');
+  const sysCores = document.getElementById('sys-cores');
+
+  function pct(x) { return Math.max(0, Math.min(100, x)) + '%'; }
+
+  es.addEventListener('sysstats', (e) => {
+    const s = JSON.parse(e.data);
+    if (s.cpu_avg_pct !== undefined) {
+      sysCpuPct.textContent = s.cpu_avg_pct.toFixed(0);
+      sysCpuFill.style.width = pct(s.cpu_avg_pct);
+    }
+    if (s.gpu_pct !== undefined) {
+      sysGpuPct.textContent = s.gpu_pct;
+      sysGpuFill.style.width = pct(s.gpu_pct);
+    }
+    if (s.ram_used_mb !== undefined && s.ram_total_mb) {
+      const usedGB = (s.ram_used_mb / 1024).toFixed(1);
+      const totalGB = (s.ram_total_mb / 1024).toFixed(1);
+      sysRamUsed.textContent = usedGB;
+      sysRamTotal.textContent = totalGB;
+      sysRamFill.style.width = pct(100 * s.ram_used_mb / s.ram_total_mb);
+    }
+    if (s.swap_used_mb !== undefined && s.swap_total_mb) {
+      sysSwapUsed.textContent = s.swap_used_mb;
+      sysSwapTotal.textContent = s.swap_total_mb;
+      sysSwapFill.style.width = pct(100 * s.swap_used_mb / s.swap_total_mb);
+    }
+    if (s.tj_temp_c !== undefined) sysTj.textContent = s.tj_temp_c.toFixed(1);
+    if (s.cpu_temp_c !== undefined) sysCpuTemp.textContent = s.cpu_temp_c.toFixed(1);
+    if (s.gpu_temp_c !== undefined) sysGpuTemp.textContent = s.gpu_temp_c.toFixed(1);
+    if (s.power_in_mw !== undefined) sysPower.textContent = (s.power_in_mw / 1000).toFixed(2);
+    if (Array.isArray(s.cpu_per_core)) {
+      sysCores.innerHTML = 'cores ' + s.cpu_per_core.map(c =>
+        `<i class="core" style="--p:${c}%"></i>`
+      ).join('');
+    }
+  });
+})();
+</script>
+{% endblock %}

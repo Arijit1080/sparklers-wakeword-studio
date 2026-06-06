@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{% block title %}Sparklers Wakeword Studio{% endblock %}</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">✨ Sparklers Wakeword Studio</div>
+    <nav>
+      <a href="/">Home</a>
+      <a href="/train">Train</a>
+      <a href="/dashboard">Dashboard</a>
+    </nav>
+  </header>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

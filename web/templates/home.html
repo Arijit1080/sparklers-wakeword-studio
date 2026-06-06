@@ -1,0 +1,103 @@
+{% extends "_base.html" %}
+{% block title %}Sparklers Wakeword Studio — home{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>Pick wakewords to listen for</h1>
+  <p class="lede">Pre-trained models work out of the box.  Custom-trained ones
+    (any <code>.joblib</code> in <code>models/</code>) show up here too.
+    Train a new one anytime from the <a href="/train">Train</a> tab.</p>
+
+  <form id="start-form" class="form-grid">
+    <fieldset class="models">
+      <legend>Available models</legend>
+      {% set has_custom = namespace(any=false) %}
+      {% for m in models if m.source == 'custom' %}{% set has_custom.any = true %}{% endfor %}
+
+      {% if has_custom.any %}
+      <div class="model-group">
+        <h4>Custom <span class="tag">trained</span></h4>
+        {% for m in models if m.source == 'custom' %}
+        <div class="model-row">
+          <label class="grow">
+            <input type="checkbox" name="model" value="{{ m.key }}" checked>
+            <span class="key">{{ m.key }}</span>
+            {% if m.auc %}<span class="muted">AUC {{ '%.3f' % m.auc }}</span>{% endif %}
+            {% if m.suggested_threshold %}<span class="muted">thr {{ '%.2f' % m.suggested_threshold }}</span>{% endif %}
+            <span class="muted">{{ m.size_kb }} KB</span>
+          </label>
+          <button type="button" class="btn small danger del-model"
+                  data-name="{{ m.key }}" title="delete this model">✗</button>
+        </div>
+        {% endfor %}
+      </div>
+      {% endif %}
+
+      <div class="model-group">
+        <h4>Pre-trained <span class="tag muted">community</span></h4>
+        {% for m in models if m.source == 'pretrained' %}
+        <label class="model-row">
+          <input type="checkbox" name="model" value="{{ m.key }}"
+            {% if not has_custom.any and m.key == 'hey_jarvis' %}checked{% endif %}>
+          <span class="key">{{ m.key }}</span>
+        </label>
+        {% endfor %}
+      </div>
+    </fieldset>
+
+    <div class="settings-grid">
+      <label>Threshold
+        <input type="number" name="threshold" value="0.3" min="0.05" max="1.0" step="0.05">
+      </label>
+      <label>Patience (frames)
+        <input type="number" name="patience" value="1" min="1" max="5">
+      </label>
+      <label>VAD threshold (0=off)
+        <input type="number" name="vad_threshold" value="0.3" min="0" max="1.0" step="0.05">
+      </label>
+    </div>
+
+    <button type="submit" class="btn primary big">▶ Start listening</button>
+  </form>
+</section>
+
+<section class="card subtle">
+  <h3>How to add a custom model</h3>
+  <ol>
+    <li>Train a custom wake-word ONNX file on Colab (~10 min on T4 GPU)</li>
+    <li><code>scp arijit.onnx jetson@jetson.local:~/jetson-wakeword-studio/models/</code></li>
+    <li>Refresh this page — the new model appears in the list</li>
+  </ol>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.querySelectorAll('.del-model').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const name = btn.dataset.name;
+    if (!confirm(`Delete custom model "${name}"?  This removes models/${name}.joblib.`)) return;
+    const fd = new FormData();  fd.set('name', name);
+    const r = await fetch('/api/model/delete', { method: 'POST', body: fd });
+    const j = await r.json();
+    if (!j.ok) { alert(j.error || 'failed to delete'); return; }
+    window.location.reload();
+  });
+});
+
+document.getElementById('start-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const models = fd.getAll('model').join(',');
+  if (!models) { alert('Pick at least one model'); return; }
+  const params = new FormData();
+  params.set('models', models);
+  params.set('threshold', fd.get('threshold'));
+  params.set('patience', fd.get('patience'));
+  params.set('vad_threshold', fd.get('vad_threshold'));
+  const r = await fetch('/api/listen/start', { method: 'POST', body: params });
+  const j = await r.json();
+  if (!j.ok) { alert(j.error || 'failed to start'); return; }
+  window.location.href = '/dashboard';
+});
+</script>
+{% endblock %}

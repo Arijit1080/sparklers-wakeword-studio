@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+venv/
+.venv/
+data/train/
+data/eval/
+models/*.onnx
+!models/.gitkeep
+*.wav
+.DS_Store
