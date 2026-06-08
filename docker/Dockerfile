@@ -51,6 +51,24 @@ import download_voices; \
 download_voices.VOICES_DIR = __import__('pathlib').Path('/opt/sparklers-ww/piper_voices'); \
 download_voices.main()"
 
+# ----- 3.5. Pre-bake the keyword-INDEPENDENT negative training samples -----
+# Synthesizes ~680 distractor utterances with Piper and computes the OWW
+# ONNX features for the 480 voice-distractors.  Burns ~5-8 min once at
+# image build time so every `train` shaves the same off its wall-clock
+# (training goes from ~30 min → ~5 min on Jetson Orin Nano Super).
+# Layer cache is keyed on the four files copied below; edit anything
+# else in the repo and this expensive layer stays cached.
+COPY tools/generate_samples.py /opt/sparklers-bake/tools/generate_samples.py
+COPY tools/parallel_synth.py   /opt/sparklers-bake/tools/parallel_synth.py
+COPY tools/bake_negatives.py   /opt/sparklers-bake/tools/bake_negatives.py
+COPY audio/oww_features.py     /opt/sparklers-bake/audio/oww_features.py
+RUN mkdir -p /opt/sparklers-ww/cache && \
+    cd /opt/sparklers-bake && \
+    PYTHONPATH=/opt/sparklers-bake \
+    SPARKLERS_PIPER_VOICES=/opt/sparklers-ww/piper_voices \
+    SPARKLERS_CACHE_DIR=/opt/sparklers-ww/cache \
+        python3 tools/bake_negatives.py
+
 # ----- 4. App code (LAST, edits don't bust expensive layers above) -----
 WORKDIR /app
 COPY audio/ /app/audio/
@@ -68,7 +86,8 @@ VOLUME ["/app/data", "/app/models"]
 ENV PYTHONPATH=/app \
     SPARKLERS_DATA_DIR=/app/data \
     SPARKLERS_MODELS_DIR=/app/models \
-    SPARKLERS_PIPER_VOICES=/opt/sparklers-ww/piper_voices
+    SPARKLERS_PIPER_VOICES=/opt/sparklers-ww/piper_voices \
+    SPARKLERS_CACHE_DIR=/opt/sparklers-ww/cache
 
 EXPOSE 8082
 

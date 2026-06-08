@@ -422,23 +422,35 @@ class WakewordService:
                     _fetch(mu, VOICES_DIR / f"{name}.onnx")
                     _fetch(cu, VOICES_DIR / f"{name}.onnx.json")
 
-            # ----- 2. generate samples -----
+            # ----- 2. plan + generate samples -----
             # We include three negative classes — voice distractors,
             # silence/low-noise (so the model knows ambient room audio is
             # NOT the keyword), and noisy distractors (real rooms aren't
             # studio-clean TTS).
+            #
+            # Speed strategy (vs. the original serial pipeline):
+            #   • Pre-baked cache (tools/bake_negatives.py at Docker
+            #     build time) supplies voice-distractor FEATURES and
+            #     noisy-distractor base WAVs — saves ~480 Piper calls
+            #     and ~480 ONNX feature passes.
+            #   • Parallel Piper across one process per voice for the
+            #     keyword-specific work that the cache can't cover
+            #     (positives + multi-word hard negatives).
             N_SILENCE = 200
             N_NOISY = 200
+            N_HARD_SUFFIX = 150
+            N_HARD_PREFIX = 150
             voices = sorted([p.stem for p in VOICES_DIR.glob("*.onnx")])
-            total_synth = len(voices) * (n_per_voice + neg_per_voice) + N_SILENCE + N_NOISY
-            self.emit({"type": "train_progress", "phase": "synth",
-                       "msg": f"generating {total_synth} samples…"})
             from tools.generate_samples import (
                 _load_voice, _synthesize, _pad_or_crop_centered, _save_wav,
                 _make_silence, _mix_with_noise,
                 POS_DIR, NEG_DIR, DISTRACTOR_TEXTS,
             )
+            from tools.parallel_synth import synth_voice_tasks
+            from concurrent.futures import ProcessPoolExecutor, as_completed
+            import multiprocessing as mp
             import random
+            import time as _time
             random.seed(42)
             rng = np.random.default_rng(42)
             POS_DIR.mkdir(parents=True, exist_ok=True)
@@ -446,77 +458,62 @@ class WakewordService:
             # wipe any prior synthesis for this keyword to keep counts clean
             for p in list(POS_DIR.glob("*.wav")) + list(NEG_DIR.glob("*.wav")):
                 p.unlink()
+
+            # try the pre-baked cache; on miss we live-synth everything
+            try:
+                from tools.negatives_cache import load as _load_neg_cache
+                neg_cache = _load_neg_cache(voices)
+            except Exception as _exc:
+                print(f"[train] negatives cache load error: {_exc}",
+                      flush=True)
+                neg_cache = None
+            if neg_cache is not None:
+                print(f"[train] negatives cache HIT — "
+                      f"{neg_cache.n_voice_distractors} VD feats, "
+                      f"{neg_cache.n_noisy} noisy base WAVs", flush=True)
+            else:
+                print("[train] negatives cache MISS — live-synth fallback",
+                      flush=True)
+
+            # --- build per-voice task lists for parallel synth ---
             keyword_variants = [keyword, keyword.lower(),
                                  keyword + ".", keyword + "!"]
-            done = 0
+            per_voice_tasks: dict[str, list[tuple[str, str]]] = {
+                v: [] for v in voices
+            }
+            # positives — always live-synthed
             for v in voices:
-                voice = _load_voice(VOICES_DIR, v)
                 for i in range(n_per_voice):
-                    text = random.choice(keyword_variants)
-                    audio = _synthesize(voice, text)
-                    audio = _pad_or_crop_centered(audio)
-                    _save_wav(audio, POS_DIR / f"{v}_{i:03d}.wav")
-                    done += 1
-                    if done % 25 == 0 or done == total_synth:
-                        frac = 0.05 + 0.30 * (done / total_synth)
-                        self._push_status(
-                            train_phase="synth",
-                            train_progress=frac,
-                            train_progress_text=
-                            f"synth {done}/{total_synth}  ({v} pos)",
-                        )
-                for i in range(neg_per_voice):
-                    text = random.choice(DISTRACTOR_TEXTS)
-                    audio = _synthesize(voice, text)
-                    audio = _pad_or_crop_centered(audio)
-                    _save_wav(audio, NEG_DIR / f"{v}_{i:03d}.wav")
-                    done += 1
-                    if done % 25 == 0 or done == total_synth:
-                        frac = 0.05 + 0.30 * (done / total_synth)
-                        self._push_status(
-                            train_phase="synth",
-                            train_progress=frac,
-                            train_progress_text=
-                            f"synth {done}/{total_synth}  ({v} neg)",
-                        )
+                    per_voice_tasks[v].append((
+                        str(POS_DIR / f"{v}_{i:03d}.wav"),
+                        random.choice(keyword_variants),
+                    ))
+            # voice distractors — live-synth only on cache miss
+            if neg_cache is None:
+                for v in voices:
+                    for i in range(neg_per_voice):
+                        per_voice_tasks[v].append((
+                            str(NEG_DIR / f"{v}_{i:03d}.wav"),
+                            random.choice(DISTRACTOR_TEXTS),
+                        ))
 
-            # silence + low-level noise negatives
-            for i in range(N_SILENCE):
-                noise_dbfs = float(rng.uniform(-65.0, -35.0))
-                audio = _make_silence(rng, noise_dbfs=noise_dbfs)
-                _save_wav(audio, NEG_DIR / f"_silence_{i:04d}.wav")
-                done += 1
-                if done % 50 == 0:
-                    frac = 0.05 + 0.30 * (done / total_synth)
-                    self._push_status(
-                        train_phase="synth", train_progress=frac,
-                        train_progress_text=f"synth silence {i+1}/{N_SILENCE}",
-                    )
-
-            # ---- hard negatives for multi-word keywords ----
-            # Two failure modes we need to teach against:
+            # hard negatives for multi-word keywords.  Two failure modes:
             #   1. suffix alone:  "krishna" should NOT fire "hey krishna"
-            #   2. prefix alone:  "hey" (or "hey there") should NOT fire any
-            #                     "hey X" model
-            # We generate ~150 of each.  Without (2) the classifier latches
-            # onto "hey" as the positive signal and fires on just "heyyy".
+            #   2. prefix alone:  "hey there" should NOT fire any "hey X"
+            # Without (2) the classifier latches onto "hey" as the
+            # positive signal and fires on just "heyyy".
             words = keyword.strip().split()
-            hard_neg_count = 0
+            suffix_variants: list[str] = []
+            prefix_variants: list[str] = []
             if len(words) >= 2:
                 prefix = words[0]
                 suffix = " ".join(words[1:])
-
-                # --- suffix-only hard negatives ---
                 suffix_variants = [
                     suffix, suffix.lower(), suffix + ".", suffix + "!",
                     f"hi {suffix}", f"hello {suffix}",
                     f"yo {suffix}", f"oh {suffix}",
                     f"{suffix} please", f"{suffix} here",
                 ]
-                # --- prefix-only hard negatives ---
-                # Real-world phrases that start with "hey" but aren't the
-                # wake word.  Drawn-out "heyyy", common "hey + something",
-                # "hey" embedded mid-sentence.
                 prefix_variants = [
                     prefix, prefix + ".", prefix + "!",
                     f"{prefix} there", f"{prefix} you",
@@ -526,96 +523,222 @@ class WakewordService:
                     f"oh {prefix}", f"say {prefix}",
                     f"{prefix} {prefix}",
                 ]
-
-                N_HARD_SUFFIX = 150
-                N_HARD_PREFIX = 150
-                N_HARD = N_HARD_SUFFIX + N_HARD_PREFIX
-                self.emit({"type": "train_progress", "phase": "synth",
-                           "msg": f"hard-negatives: {N_HARD_SUFFIX} suffix-only "
-                                  f"+ {N_HARD_PREFIX} prefix-only…"})
                 for i in range(N_HARD_SUFFIX):
                     v = voices[i % len(voices)]
-                    voice = _load_voice(VOICES_DIR, v)
-                    text = random.choice(suffix_variants)
-                    audio = _synthesize(voice, text)
-                    audio = _pad_or_crop_centered(audio)
-                    _save_wav(audio, NEG_DIR / f"_hardneg_sfx_{i:04d}.wav")
-                    hard_neg_count += 1
-                    done += 1
-                    if done % 25 == 0:
-                        frac = 0.05 + 0.30 * (done / (total_synth + N_HARD))
-                        self._push_status(
-                            train_phase="synth", train_progress=frac,
-                            train_progress_text=
-                            f"suffix-only neg {i+1}/{N_HARD_SUFFIX}  ('{text}')",
-                        )
+                    per_voice_tasks[v].append((
+                        str(NEG_DIR / f"_hardneg_sfx_{i:04d}.wav"),
+                        random.choice(suffix_variants),
+                    ))
                 for i in range(N_HARD_PREFIX):
                     v = voices[i % len(voices)]
-                    voice = _load_voice(VOICES_DIR, v)
-                    text = random.choice(prefix_variants)
-                    audio = _synthesize(voice, text)
-                    audio = _pad_or_crop_centered(audio)
-                    _save_wav(audio, NEG_DIR / f"_hardneg_pfx_{i:04d}.wav")
-                    hard_neg_count += 1
-                    done += 1
-                    if done % 25 == 0:
-                        frac = 0.05 + 0.30 * (done / (total_synth + N_HARD))
-                        self._push_status(
-                            train_phase="synth", train_progress=frac,
-                            train_progress_text=
-                            f"prefix-only neg {i+1}/{N_HARD_PREFIX}  ('{text}')",
-                        )
+                    per_voice_tasks[v].append((
+                        str(NEG_DIR / f"_hardneg_pfx_{i:04d}.wav"),
+                        random.choice(prefix_variants),
+                    ))
 
-            # noisy distractor negatives (TTS distractors + noise mix)
-            for i in range(N_NOISY):
-                v = voices[i % len(voices)]
-                voice = _load_voice(VOICES_DIR, v)
-                text = random.choice(DISTRACTOR_TEXTS)
-                audio = _synthesize(voice, text)
-                audio = _pad_or_crop_centered(audio)
-                audio = _mix_with_noise(audio, rng,
-                                         snr_db=float(rng.uniform(5.0, 15.0)))
-                _save_wav(audio, NEG_DIR / f"_noisy_{i:04d}.wav")
-                done += 1
-                if done % 25 == 0 or done == total_synth:
-                    frac = 0.05 + 0.30 * (done / total_synth)
+            # noisy distractor BASE WAVs — only live-synth on cache miss.
+            # When we have the cache, we lift base WAVs directly out of
+            # it and just mix per-run noise in below (mix is ~ms-cheap).
+            if neg_cache is None:
+                for i in range(N_NOISY):
+                    v = voices[i % len(voices)]
+                    per_voice_tasks[v].append((
+                        str(NEG_DIR / f"_noisy_base_{i:04d}.wav"),
+                        random.choice(DISTRACTOR_TEXTS),
+                    ))
+
+            total_tasks = sum(len(t) for t in per_voice_tasks.values())
+            self.emit({"type": "train_progress", "phase": "synth",
+                       "msg": f"parallel-synth {total_tasks} samples "
+                              f"on {len(voices)} workers…"})
+            self._push_status(
+                train_phase="synth", train_progress=0.06,
+                train_progress_text=
+                f"spawning {len(voices)} Piper workers…",
+            )
+
+            # --- run parallel synth ---
+            # spawn (not fork) so workers don't inherit ONNX/audio state
+            # held by the live-listen thread.  Spawn costs ~1s/worker once.
+            spawn_ctx = mp.get_context("spawn")
+            done = 0
+            t_synth0 = _time.perf_counter()
+            with ProcessPoolExecutor(max_workers=len(voices),
+                                      mp_context=spawn_ctx) as ex:
+                futs = {
+                    ex.submit(synth_voice_tasks,
+                              v, str(VOICES_DIR),
+                              per_voice_tasks[v], 42 + idx): v
+                    for idx, v in enumerate(voices)
+                    if per_voice_tasks[v]
+                }
+                for f in as_completed(futs):
+                    v = futs[f]
+                    n_done = f.result()
+                    done += n_done
+                    frac = 0.06 + 0.24 * (done / max(1, total_tasks))
                     self._push_status(
                         train_phase="synth", train_progress=frac,
-                        train_progress_text=f"synth noisy {i+1}/{N_NOISY}",
+                        train_progress_text=
+                        f"synth {done}/{total_tasks} (voice {v} done)",
+                    )
+            synth_secs = _time.perf_counter() - t_synth0
+            print(f"[train] parallel synth: {done} samples in "
+                  f"{synth_secs:.1f}s "
+                  f"(~{done / max(0.1, synth_secs):.0f}/s)", flush=True)
+
+            # --- silence (procedural, fast — stays in main thread) ---
+            for i in range(N_SILENCE):
+                noise_dbfs = float(rng.uniform(-65.0, -35.0))
+                audio = _make_silence(rng, noise_dbfs=noise_dbfs)
+                _save_wav(audio, NEG_DIR / f"_silence_{i:04d}.wav")
+            self._push_status(
+                train_phase="synth", train_progress=0.32,
+                train_progress_text=f"silence {N_SILENCE} done",
+            )
+
+            # --- per-run noise mix on noisy-distractor bases ---
+            # We always do the noise mix per-train (so the noise
+            # realization differs run-to-run) but the underlying clean
+            # TTS came either from disk (cache miss) or from the cache.
+            from audio.mic import load_wav
+            if neg_cache is not None:
+                noisy_base = neg_cache.noisy_base_wavs
+            else:
+                base_paths = sorted(NEG_DIR.glob("_noisy_base_*.wav"))
+                noisy_base = np.stack([
+                    load_wav(str(p)).samples for p in base_paths
+                ]) if base_paths else np.zeros((0, 0), dtype=np.int16)
+                # tidy up base WAVs so they aren't picked up by embed glob
+                for p in base_paths:
+                    p.unlink()
+
+            noisy_mixed = np.zeros(
+                (noisy_base.shape[0], noisy_base.shape[1] if noisy_base.ndim == 2 else 0),
+                dtype=np.int16,
+            ) if noisy_base.size else np.zeros((0, 0), dtype=np.int16)
+            for i in range(noisy_base.shape[0]):
+                mixed = _mix_with_noise(
+                    noisy_base[i], rng,
+                    snr_db=float(rng.uniform(5.0, 15.0)),
+                )
+                noisy_mixed[i] = mixed
+                _save_wav(mixed, NEG_DIR / f"_noisy_{i:04d}.wav")
+
+            # ----- 3. embed (parallel; skips cached voice-distractor rows) -----
+            # Strategy: fan WAV paths out to N worker processes, each
+            # running its own OWWFeatures (single-threaded ONNX so they
+            # don't fight for cores).  At Jetson Orin scale this turns a
+            # ~5 min serial embed phase into ~1 min.
+            #
+            # The noisy mixed WAVs are already on disk at _noisy_*.wav
+            # (we wrote them above for debug visibility), so we just
+            # glob them up like everything else.
+            self.emit({"type": "train_progress", "phase": "embed",
+                       "msg": "extracting features for keyword-specific "
+                              "+ procedural samples…"})
+            self._push_status(
+                train_phase="embed", train_progress=0.35,
+                train_progress_text="spawning embed workers…",
+            )
+
+            pos_wavs = sorted(POS_DIR.glob("*.wav"))
+            neg_wavs = sorted(NEG_DIR.glob("*.wav"))  # silence + hardneg
+                                                       # + noisy + (VD if miss)
+            t_embed0 = _time.perf_counter()
+
+            import os as _os
+            from tools.parallel_synth import embed_wav_batch
+            # 6 workers on 6-core Orin gives the best wall-clock; more
+            # workers just add ONNX session memory pressure for no gain.
+            n_embed_workers = min(6, max(1, (_os.cpu_count() or 6) - 1))
+
+            def _chunk(items: list, n: int) -> list[list]:
+                if n <= 0 or not items:
+                    return []
+                k, r = divmod(len(items), n)
+                out: list[list] = []
+                idx = 0
+                for w in range(n):
+                    take = k + (1 if w < r else 0)
+                    if take:
+                        out.append(items[idx:idx + take])
+                        idx += take
+                return out
+
+            pos_batches = _chunk([str(p) for p in pos_wavs], n_embed_workers)
+            neg_batches = _chunk([str(p) for p in neg_wavs], n_embed_workers)
+
+            # Dispatch both pos + neg batches into the same pool so all
+            # workers stay busy.  We keep their results separated via the
+            # (kind, idx) labels so the final stack preserves filename order.
+            pos_results: list[np.ndarray | None] = [None] * len(pos_batches)
+            neg_results: list[np.ndarray | None] = [None] * len(neg_batches)
+            n_embed_total = len(pos_wavs) + len(neg_wavs)
+            done_embed = 0
+            with ProcessPoolExecutor(max_workers=n_embed_workers,
+                                      mp_context=spawn_ctx) as ex:
+                futs = {}
+                for i, batch in enumerate(pos_batches):
+                    futs[ex.submit(embed_wav_batch, batch)] = ("pos", i, len(batch))
+                for i, batch in enumerate(neg_batches):
+                    futs[ex.submit(embed_wav_batch, batch)] = ("neg", i, len(batch))
+                for f in as_completed(futs):
+                    kind, idx, n = futs[f]
+                    arr = f.result()
+                    if kind == "pos":
+                        pos_results[idx] = arr
+                    else:
+                        neg_results[idx] = arr
+                    done_embed += n
+                    frac = 0.35 + 0.50 * (done_embed / max(1, n_embed_total))
+                    self._push_status(
+                        train_phase="embed", train_progress=frac,
+                        train_progress_text=
+                        f"embed {done_embed}/{n_embed_total}",
                     )
 
-            # ----- 3. embed everything -----
-            self.emit({"type": "train_progress", "phase": "embed",
-                       "msg": "extracting features for all samples…"})
-            extractor = self._ensure_features()
-            from audio.mic import load_wav
-            pos_wavs = sorted(POS_DIR.glob("*.wav"))
-            neg_wavs = sorted(NEG_DIR.glob("*.wav"))
-            n_total = len(pos_wavs) + len(neg_wavs)
-            Xp = np.zeros((len(pos_wavs), WINDOW_FRAMES * EMBED_DIM),
-                           dtype=np.float32)
-            Xn = np.zeros((len(neg_wavs), WINDOW_FRAMES * EMBED_DIM),
-                           dtype=np.float32)
-            for i, p in enumerate(pos_wavs):
-                Xp[i] = extractor.embed_clip(load_wav(str(p)).samples)
-                if (i + 1) % 30 == 0 or i + 1 == len(pos_wavs):
-                    frac = 0.35 + 0.50 * ((i + 1) / n_total)
-                    self._push_status(
-                        train_phase="embed",
-                        train_progress=frac,
-                        train_progress_text=
-                        f"embed {i+1}/{len(pos_wavs)} pos",
-                    )
-            for j, p in enumerate(neg_wavs):
-                Xn[j] = extractor.embed_clip(load_wav(str(p)).samples)
-                if (j + 1) % 30 == 0 or j + 1 == len(neg_wavs):
-                    frac = 0.35 + 0.50 * ((len(pos_wavs) + j + 1) / n_total)
-                    self._push_status(
-                        train_phase="embed",
-                        train_progress=frac,
-                        train_progress_text=
-                        f"embed {j+1}/{len(neg_wavs)} neg",
-                    )
+            empty = np.zeros((0, WINDOW_FRAMES * EMBED_DIM), dtype=np.float32)
+            Xp = (np.vstack([a for a in pos_results if a is not None])
+                  if any(a is not None for a in pos_results) else empty)
+            Xn_live = (np.vstack([a for a in neg_results if a is not None])
+                       if any(a is not None for a in neg_results) else empty)
+
+            # cached voice-distractor features (no synth, no embed)
+            if neg_cache is not None:
+                vd_chunks = []
+                shortfall_texts: list[tuple[str, str]] = []
+                for v in voices:
+                    rows = neg_cache.features_for(v, neg_per_voice)
+                    vd_chunks.append(rows)
+                    if rows.shape[0] < neg_per_voice:
+                        shortfall = neg_per_voice - rows.shape[0]
+                        print(f"[train] cache short by {shortfall} for "
+                              f"voice {v} — will top up live", flush=True)
+                        for _k in range(shortfall):
+                            shortfall_texts.append(
+                                (v, random.choice(DISTRACTOR_TEXTS))
+                            )
+                if shortfall_texts:
+                    # rare path: live-synth + embed the shortfall in this
+                    # process.  Keeps the codepath simple; if a user ever
+                    # actually pushes neg_per_voice this high we can
+                    # parallelize this path too.
+                    extractor = self._ensure_features()
+                    for v, text in shortfall_texts:
+                        voice = _load_voice(VOICES_DIR, v)
+                        audio = _synthesize(voice, text)
+                        audio = _pad_or_crop_centered(audio)
+                        vd_chunks.append(extractor.embed_clip(audio)[None, :])
+                Xn_cached = np.vstack(vd_chunks) if vd_chunks else empty
+            else:
+                Xn_cached = empty
+
+            Xn = np.vstack([Xn_live, Xn_cached])
+            print(f"[train] embed: {_time.perf_counter() - t_embed0:.1f}s  "
+                  f"(pos={Xp.shape[0]} live_neg={Xn_live.shape[0]} "
+                  f"cached_VD={Xn_cached.shape[0]}, "
+                  f"{n_embed_workers} workers)", flush=True)
 
             # ----- 4. fit -----
             self._push_status(train_phase="fit",
