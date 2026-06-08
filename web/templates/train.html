@@ -3,15 +3,16 @@
 {% block content %}
 <section class="card">
   <h1>Train a new wakeword</h1>
-  <p class="lede">Generates ~780 synthetic samples in ~6 voices using Piper TTS,
-    extracts features with OpenWakeWord, fits a logistic regression
-    classifier, evaluates, and saves a <code>.joblib</code> model.  Total
-    ~6–10 minutes depending on disk + CPU.</p>
+  <p class="lede">Generates ~1100 synthetic samples in 6 voices using Piper
+    TTS, augments with reverb/noise/pitch jitter, optionally mixes in
+    pitch-shifted recordings of <em>your</em> voice, extracts features
+    with OpenWakeWord, fits a logistic regression classifier, and saves
+    a <code>.joblib</code> model.  ~3 minutes on a Jetson Orin Nano.</p>
 
   <form id="train-form" class="form-grid">
     <label>Keyword
       <input type="text" name="keyword" required pattern="[A-Za-z][A-Za-z0-9 ]*"
-             placeholder="e.g. Arijit" autofocus>
+             placeholder="e.g. Arijit" autofocus id="kw-input">
       <small class="muted">3+ syllables work best.  Letters only.</small>
     </label>
     <div class="settings-grid">
@@ -24,6 +25,28 @@
     </div>
     <button type="submit" id="train-btn" class="btn primary big">▶ Start training</button>
   </form>
+</section>
+
+<section class="card subtle" id="record-card">
+  <h2>🎙 Record yourself <small class="muted">(optional but recommended)</small></h2>
+  <p class="lede">The TTS voices are studio-clean; your room and mic aren't.
+    Recording 10 short clips of yourself saying the keyword tells the
+    classifier what your <em>actual</em> voice + room + mic sound like,
+    and the trainer pitch-shifts those clips ±2 / ±4 semitones to also
+    cover other people's voices.  Typically lifts your confidence
+    score from ~0.45 to ~0.90.</p>
+
+  <div class="row" style="align-items:center; gap:14px; margin-top:8px">
+    <button id="rec-btn" class="btn primary">▶ Record 10 samples</button>
+    <button id="rec-clear-btn" class="btn" style="display:none">Clear my samples</button>
+    <span id="rec-count" class="muted"></span>
+  </div>
+
+  <div id="rec-prog" class="hidden" style="margin-top:14px">
+    <h3 id="rec-phase">Recording…</h3>
+    <p id="rec-hint" class="lede"></p>
+    <div class="meter big"><div id="rec-bar"></div></div>
+  </div>
 </section>
 
 <section id="prog-card" class="card hidden">
@@ -104,17 +127,104 @@
     error:    'Error',
   };
 
+  // ---------- record-yourself flow ----------
+  const kwInput     = document.getElementById('kw-input');
+  const recBtn      = document.getElementById('rec-btn');
+  const recClearBtn = document.getElementById('rec-clear-btn');
+  const recCount    = document.getElementById('rec-count');
+  const recProg     = document.getElementById('rec-prog');
+  const recPhase    = document.getElementById('rec-phase');
+  const recHint     = document.getElementById('rec-hint');
+  const recBar      = document.getElementById('rec-bar');
+
+  const REC_TOTAL = 10;
+  let recInFlight = false;
+
+  async function refreshSampleCount() {
+    const kw = kwInput.value.trim();
+    if (!kw) { recCount.textContent = ''; recClearBtn.style.display = 'none'; return; }
+    try {
+      const r = await fetch('/api/train/user_samples?keyword=' + encodeURIComponent(kw));
+      const j = await r.json();
+      if (j.ok && j.count > 0) {
+        recCount.textContent = `✓ ${j.count} samples saved for "${kw}"`;
+        recClearBtn.style.display = 'inline-block';
+      } else {
+        recCount.textContent = 'no samples yet';
+        recClearBtn.style.display = 'none';
+      }
+    } catch (_) {}
+  }
+
+  kwInput.addEventListener('input', refreshSampleCount);
+  refreshSampleCount();
+
+  recBtn.addEventListener('click', async () => {
+    const kw = kwInput.value.trim();
+    if (!kw) { alert('enter a keyword first'); return; }
+    const fd = new FormData();
+    fd.append('keyword', kw);
+    fd.append('n_samples', REC_TOTAL);
+    const r = await fetch('/api/train/record_samples', { method: 'POST', body: fd });
+    const j = await r.json();
+    if (!j.ok) { alert(j.error || 'recording failed to start'); return; }
+    recInFlight = true;
+    recBtn.disabled = true; recClearBtn.disabled = true;
+    recProg.classList.remove('hidden');
+    recPhase.textContent = 'Get ready…';
+    recHint.textContent = 'on each "beep", say the keyword once and stop.';
+    recBar.style.width = '0%';
+  });
+
+  recClearBtn.addEventListener('click', async () => {
+    const kw = kwInput.value.trim();
+    if (!kw) return;
+    if (!confirm(`Delete all recorded samples for "${kw}"?`)) return;
+    const fd = new FormData(); fd.append('keyword', kw);
+    await fetch('/api/train/clear_user_samples', { method: 'POST', body: fd });
+    refreshSampleCount();
+  });
+
   const es = new EventSource('/events');
   es.addEventListener('status', (e) => {
     const s = JSON.parse(e.data);
-    if (s.state !== 'training' && s.train_phase !== 'done') return;
-    const phase = s.train_phase || 'starting';
-    const p = Math.max(0, Math.min(1, s.train_progress || 0));
-    bar.style.width = (p * 100).toFixed(1) + '%';
-    pctNow.textContent = (p * 100).toFixed(0) + '%';
-    phaseNow.textContent = PHASE_LABELS[phase] || phase;
-    lab.textContent = `${PHASE_LABELS[phase] || phase} — ${s.train_keyword}`;
-    if (s.train_progress_text) txt.textContent = s.train_progress_text;
+
+    // --- training progress (existing) ---
+    if (s.state === 'training' || s.train_phase === 'done') {
+      const phase = s.train_phase || 'starting';
+      const p = Math.max(0, Math.min(1, s.train_progress || 0));
+      bar.style.width = (p * 100).toFixed(1) + '%';
+      pctNow.textContent = (p * 100).toFixed(0) + '%';
+      phaseNow.textContent = PHASE_LABELS[phase] || phase;
+      lab.textContent = `${PHASE_LABELS[phase] || phase} — ${s.train_keyword}`;
+      if (s.train_progress_text) txt.textContent = s.train_progress_text;
+    }
+
+    // --- recording progress (new) ---
+    if (s.state === 'recording' || s.rec_status === 'done') {
+      recInFlight = true;
+      const total = s.rec_total || REC_TOTAL;
+      const done  = s.rec_done || 0;
+      recBar.style.width = (100 * done / Math.max(1, total)).toFixed(0) + '%';
+      const phaseText = {
+        ready:     `Sample ${done + 1} / ${total} — get ready…`,
+        recording: `Sample ${done + 1} / ${total} — SAY IT NOW`,
+        pause:     `Sample ${done} / ${total} captured — pause…`,
+        done:      `✓ ${done} samples saved`,
+        error:     'Recording error — check logs',
+      }[s.rec_status] || `Recording (${done}/${total})…`;
+      recPhase.textContent = phaseText;
+      if (s.rec_status === 'done') {
+        recInFlight = false;
+        recBtn.disabled = false; recClearBtn.disabled = false;
+        refreshSampleCount();
+        // collapse the progress card after a beat so the user sees the count update
+        setTimeout(() => recProg.classList.add('hidden'), 2000);
+      } else if (s.rec_status === 'error') {
+        recInFlight = false;
+        recBtn.disabled = false; recClearBtn.disabled = false;
+      }
+    }
   });
   es.addEventListener('train_done', (e) => {
     const d = JSON.parse(e.data);

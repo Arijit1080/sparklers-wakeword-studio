@@ -77,24 +77,45 @@ def find_usb_codec_output_index() -> Optional[int]:
     return None
 
 
+def _native_input_channels(device: Optional[int]) -> int:
+    """Return the device's native input channel count, or 1 on error.
+
+    Some USB codecs (notably the Waveshare-style "USB PnP Audio Device"
+    seen on this Jetson after a reboot) refuse to open at 1 channel and
+    report -9998 Invalid number of channels.  We have to query their
+    native max_input_channels, open at that count, and down-mix to mono
+    in software.
+    """
+    try:
+        info = sd.query_devices(device)
+        return int(info.get("max_input_channels", 1))
+    except Exception:
+        return 1
+
+
 def record_blocking(duration_s: float, device: Optional[int] = None) -> Capture:
     """Block for `duration_s` seconds, return the recording as a Capture.
 
-    Uses sounddevice's `rec` which is a one-shot capture — fine for short
-    enrollment clips.  For continuous streaming the recognize loop will use
-    `InputStream` directly.
+    Opens the device at its native channel count and down-mixes to mono.
+    See `_native_input_channels` for why.
     """
     nframes = int(duration_s * SAMPLE_RATE)
+    native_in = _native_input_channels(device)
+    open_ch = 1 if native_in <= 1 else min(2, native_in)
     buf = sd.rec(
         nframes,
         samplerate=SAMPLE_RATE,
-        channels=1,
+        channels=open_ch,
         dtype=DTYPE,
         device=device,
         blocking=True,
     )
-    # sd.rec returns shape (frames, channels); flatten to (frames,)
-    return Capture(samples=buf.reshape(-1), sample_rate=SAMPLE_RATE)
+    # sd.rec returns shape (frames, channels); mix down to mono if needed
+    if open_ch > 1:
+        mono = buf.astype(np.int32).mean(axis=1).astype(np.int16)
+    else:
+        mono = buf.reshape(-1)
+    return Capture(samples=mono, sample_rate=SAMPLE_RATE)
 
 
 def record_with_meter(

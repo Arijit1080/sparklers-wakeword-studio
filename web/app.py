@@ -74,6 +74,42 @@ async def api_train_start(
     ))
 
 
+@app.post("/api/train/record_samples")
+async def api_record_samples(
+    keyword: str = Form(...),
+    n_samples: int = Form(10),
+):
+    """Optional 'record yourself' flow before training.
+
+    Records `n_samples` short clips of the user saying the keyword;
+    each clip is saved under data/train/user_pos/<kw_safe>/ and gets
+    mixed into the next train run as pitch-shifted positives.  Returns
+    immediately; the actual recording runs in a background thread —
+    poll /api/status or listen on /events for progress.
+    """
+    return JSONResponse(SERVICE.start_recording_samples(
+        keyword=keyword, n_samples=n_samples,
+    ))
+
+
+@app.post("/api/train/stop_recording")
+async def api_stop_recording():
+    return JSONResponse(SERVICE.stop_recording_samples())
+
+
+@app.post("/api/train/clear_user_samples")
+async def api_clear_user_samples(keyword: str = Form(...)):
+    return JSONResponse(SERVICE.clear_user_samples(keyword=keyword))
+
+
+@app.get("/api/train/user_samples")
+async def api_user_samples_count(keyword: str):
+    return JSONResponse({
+        "ok": True, "keyword": keyword,
+        "count": SERVICE.count_user_samples(keyword=keyword),
+    })
+
+
 @app.post("/api/model/delete")
 async def api_model_delete(name: str = Form(...)):
     return JSONResponse(SERVICE.delete_model(name))

@@ -41,7 +41,7 @@ CHUNK_SAMPLES = 1280   # OWW expects 80 ms / 16 kHz
 
 @dataclass
 class ServiceStatus:
-    state: str = "idle"                  # idle | listening | training
+    state: str = "idle"                  # idle | listening | training | recording
     model_keys: list[str] = field(default_factory=list)
     threshold: float = 0.5
     patience: int = 2
@@ -56,6 +56,11 @@ class ServiceStatus:
     train_phase: str = ""
     train_progress: float = 0.0          # 0..1
     train_progress_text: str = ""
+    # user-voice-recording-specific (optional flow before training)
+    rec_keyword: str = ""
+    rec_done: int = 0
+    rec_total: int = 0
+    rec_status: str = ""                 # "" | "ready" | "recording" | "pause" | "done"
 
 
 class WakewordService:
@@ -370,6 +375,138 @@ class WakewordService:
             return {"ok": False, "error": "no such model"}
         return {"ok": True, "deleted": deleted}
 
+    # ---------- optional: record-yourself for training ----------
+
+    def _user_pos_dir(self, kw_safe: str) -> Path:
+        return ROOT / "data" / "train" / "user_pos" / kw_safe
+
+    def count_user_samples(self, keyword: str) -> int:
+        kw_safe = keyword.strip().lower().replace(" ", "_")
+        d = self._user_pos_dir(kw_safe)
+        return len(list(d.glob("*.wav"))) if d.exists() else 0
+
+    def clear_user_samples(self, keyword: str) -> dict:
+        if self.status.state != "idle":
+            return {"ok": False,
+                    "error": f"service is busy: {self.status.state}"}
+        kw_safe = keyword.strip().lower().replace(" ", "_")
+        d = self._user_pos_dir(kw_safe)
+        n = 0
+        if d.exists():
+            for p in d.glob("*.wav"):
+                p.unlink()
+                n += 1
+            try:
+                d.rmdir()
+            except OSError:
+                pass
+        return {"ok": True, "deleted": n}
+
+    def start_recording_samples(self, keyword: str,
+                                  n_samples: int = 10,
+                                  sample_seconds: float = 1.6) -> dict:
+        if self.status.state != "idle":
+            return {"ok": False,
+                    "error": f"service is busy: {self.status.state}"}
+        if not keyword.strip():
+            return {"ok": False, "error": "keyword required"}
+        kw_safe = keyword.strip().lower().replace(" ", "_")
+        if not kw_safe.replace("_", "").isalnum():
+            return {"ok": False, "error": "keyword must be alphanumeric"}
+        self._stop.clear()
+        t = threading.Thread(
+            target=self._record_worker,
+            args=(keyword, kw_safe, int(n_samples), float(sample_seconds)),
+            name="WW-Record", daemon=True,
+        )
+        t.start()
+        return {"ok": True}
+
+    def _record_worker(self, keyword: str, kw_safe: str,
+                        n_samples: int, sample_seconds: float) -> None:
+        """Beep + record N short clips of the user saying the keyword.
+
+        Each iteration: READY beep → 1.6 s capture → DONE beep → 1.0 s
+        pause for the user to breathe.  WAVs land under
+        /app/data/train/user_pos/<kw_safe>/sample_NN.wav and persist
+        across trains (until the user clicks Clear or changes keyword).
+        """
+        from audio.mic import record_blocking, save_wav
+        from audio.beep import READY_BEEP, DONE_BEEP, COMPLETE_BEEP, play
+        from audio.mic import Capture
+        try:
+            self._push_status(
+                state="recording", rec_keyword=keyword,
+                rec_done=0, rec_total=n_samples, rec_status="ready",
+            )
+            self.emit({"type": "record_start", "keyword": keyword,
+                       "n_samples": n_samples})
+            out_dir = self._user_pos_dir(kw_safe)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            # wipe any prior recordings for this keyword so the saved set
+            # always matches what just got captured
+            for p in list(out_dir.glob("*.wav")):
+                p.unlink()
+
+            for i in range(n_samples):
+                if self._stop.is_set():
+                    self._push_status(rec_status="cancelled")
+                    self.emit({"type": "record_cancel"})
+                    return
+                # cue the user
+                self._push_status(rec_done=i, rec_status="ready",
+                                   rec_keyword=keyword)
+                try: play(READY_BEEP, device=self._out_device)
+                except Exception as e:    # noqa: BLE001
+                    print(f"[record] beep failed: {e}", flush=True)
+                # capture
+                self._push_status(rec_done=i, rec_status="recording",
+                                   rec_keyword=keyword)
+                try:
+                    cap = record_blocking(
+                        sample_seconds, device=self._in_device,
+                    )
+                except Exception as e:    # noqa: BLE001
+                    print(f"[record] capture failed: {e}", flush=True)
+                    self._push_status(
+                        state="idle", last_error=f"record failed: {e}",
+                        rec_status="error",
+                    )
+                    self.emit({"type": "record_error", "msg": str(e)})
+                    return
+                save_wav(cap, str(out_dir / f"sample_{i:02d}.wav"))
+                self._push_status(rec_done=i + 1, rec_status="pause",
+                                   rec_keyword=keyword)
+                try: play(DONE_BEEP, device=self._out_device)
+                except Exception:
+                    pass
+                # pause for breath, but allow stop mid-pause
+                for _ in range(10):
+                    if self._stop.is_set():
+                        break
+                    time.sleep(0.1)
+
+            try: play(COMPLETE_BEEP, device=self._out_device)
+            except Exception:
+                pass
+            self._push_status(
+                state="idle", rec_status="done", rec_done=n_samples,
+            )
+            self.emit({"type": "record_done", "keyword": keyword,
+                       "count": n_samples})
+        except Exception as e:    # noqa: BLE001
+            print(f"[record] fatal: {e}", flush=True)
+            self._push_status(state="idle",
+                               last_error=f"record fatal: {e}",
+                               rec_status="error")
+            self.emit({"type": "record_error", "msg": str(e)})
+
+    def stop_recording_samples(self) -> dict:
+        if self.status.state != "recording":
+            return {"ok": False, "error": "not recording"}
+        self._stop.set()
+        return {"ok": True}
+
     # ---------- training ----------
 
     def start_training(self, keyword: str, n_per_voice: int = 50,
@@ -624,6 +761,66 @@ class WakewordService:
                 )
                 noisy_mixed[i] = mixed
                 _save_wav(mixed, NEG_DIR / f"_noisy_{i:04d}.wav")
+
+            # --- augment the TTS positives ---
+            # For every clean Piper positive we produce one augmented
+            # copy with random reverb + light noise + small pitch jitter.
+            # This drags the positive-class decision boundary toward
+            # "real-mic-in-a-real-room" so the classifier doesn't fire
+            # only on studio-clean TTS.  Each aug is fast (~ms) so the
+            # whole pass is dominated by disk I/O.
+            from tools.audio_augment import augment_positive
+            t_aug0 = _time.perf_counter()
+            tts_pos_wavs = sorted(POS_DIR.glob("*.wav"))
+            n_tts_aug = 0
+            for p in tts_pos_wavs:
+                # skip anything that's already an aug copy (shouldn't be
+                # any at this point, but be defensive across retrains)
+                if "_aug" in p.stem or "_user" in p.stem:
+                    continue
+                clip = load_wav(str(p)).samples
+                aug = augment_positive(clip, rng)
+                # the aug step may have changed clip length (pitch jitter)
+                aug = _pad_or_crop_centered(aug)
+                _save_wav(aug, POS_DIR / f"{p.stem}_aug.wav")
+                n_tts_aug += 1
+
+            # --- load user-recorded positives if any, pitch-shift ---
+            # Persisted at /app/data/train/user_pos/<kw_safe>/sample_NN.wav
+            # from the optional "Record yourself" flow.  Each sample
+            # turns into 5 augmented variants ({-4,-2,0,+2,+4} semitones)
+            # — synthetic speaker diversity from a single recording set.
+            USER_POS_DIR = ROOT / "data" / "train" / "user_pos" / kw_safe
+            user_paths = sorted(USER_POS_DIR.glob("*.wav")) \
+                if USER_POS_DIR.exists() else []
+            n_user_aug = 0
+            if user_paths:
+                from tools.audio_augment import pitch_shift
+                pitch_variants = [-4.0, -2.0, 0.0, +2.0, +4.0]
+                for ui, p in enumerate(user_paths):
+                    clip = load_wav(str(p)).samples
+                    for psh in pitch_variants:
+                        shifted = pitch_shift(clip, psh) \
+                            if abs(psh) > 0.01 else clip
+                        # also apply mild reverb/noise so user samples
+                        # cover position-in-room variation
+                        shifted = augment_positive(
+                            shifted, rng,
+                            pitch_semitones=0.0,  # already pitch-shifted
+                            pitch_jitter_prob=0.0,
+                            reverb_prob=0.5, noise_prob=0.5,
+                        )
+                        shifted = _pad_or_crop_centered(shifted)
+                        _save_wav(
+                            shifted,
+                            POS_DIR / f"_user_{ui:02d}_p{int(psh):+d}.wav",
+                        )
+                        n_user_aug += 1
+            print(f"[train] augmented positives: "
+                  f"+{n_tts_aug} TTS-aug, +{n_user_aug} user "
+                  f"({len(user_paths)} recordings × 5 pitch variants) "
+                  f"in {_time.perf_counter() - t_aug0:.1f}s",
+                  flush=True)
 
             # ----- 3. embed (parallel; skips cached voice-distractor rows) -----
             # Strategy: fan WAV paths out to N worker processes, each

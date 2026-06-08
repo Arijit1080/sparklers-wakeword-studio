@@ -152,3 +152,111 @@ workers) rather than the 600 positives + hard-negs.
 - new: `tools/negatives_cache.py`
 - edit: `web/state.py` (the `_train_worker` body)
 - edit: `docker/Dockerfile` (added build step 3.5 + `SPARKLERS_CACHE_DIR` env)
+
+---
+
+## 2026-06-08  Fix the "0.4 - 0.5 misses" — TTS aug + optional user voice
+
+### The symptom
+
+After shipping the 10× speedup the user reported real-mic misses: even
+when they clearly said the keyword the classifier scored 0.4-0.5, often
+sitting just below threshold and never firing.  Lowering the threshold
+to 0.3 didn't help.  Bumping `suggested_threshold` on the model didn't
+help either.
+
+### The cause
+
+Pure TTS-trained classifier domain gap.  AUC on the held-out 10% TTS
+eval slice was **1.000** — the model has learned to discriminate the
+keyword perfectly *for studio-clean Piper voices in a vacuum*.  Real
+human speech through a USB codec into a small room lives outside that
+distribution: the embedding lands in a region the classifier has no
+training data for, so it falls back to ~0.5 (the LR prior).
+
+This is the same domain-mismatch failure mode that every TTS-trained
+wakeword has to fix one way or another.  Two complementary moves:
+
+  1. **Roughen the TTS positives** so the positive class covers
+     "reverb-stained, lightly noisy, slightly mistuned audio" rather
+     than only "studio-clean".  Pure data augmentation, no user input.
+  2. **Add a few real recordings of the user**, pitch-shifted to
+     synthesize additional speaker fundamentals.  Optional but huge.
+
+### What we built
+
+**`tools/audio_augment.py`** — three pure-numpy/scipy effects:
+
+  - `pitch_shift(audio, semitones)` — rational `resample_poly` based.
+    Also time-stretches; caller re-pads/crops to TARGET_LEN.  Works
+    cleanly up to about ±5 semitones.
+  - `apply_reverb(audio, rng, wet)` — convolves with a synthetic
+    small-room IR (direct + 5-7 randomized early reflections +
+    exponentially-decaying noise tail).  IR is `rng`-derived so each
+    augmented sample sees a slightly different "room".
+  - `mix_noise(audio, rng, snr_db)` — Gaussian white noise at a given
+    SNR.  Reused for both noisy distractors (10-15 dB) and light
+    positive jitter (20-28 dB).
+
+Plus `augment_positive(audio, rng)` — random combination of the three
+with probability-weighted defaults tuned for "TTS-to-real-mic".
+
+**`web/state.py` train flow** now runs *after* the parallel Piper synth:
+
+  - Each TTS positive gets one augmented copy (300 → 600 positives).
+    Pass is ~0.9 s of pure-numpy work — embed picks both up.
+  - If `data/train/user_pos/<kw_safe>/sample_NN.wav` exists, each user
+    sample is pitch-shifted to {-4, -2, 0, +2, +4} semitones and each
+    variant gets a small reverb/noise pass on top.  10 recordings →
+    50 augmented positives in ~0.5 s.
+
+**`audio/mic.py` `record_blocking`** — patched the same way as the
+voiceclone studio's `record_clip`: query native input channels, open
+at that count, mix to mono in software.  Avoids the PaErrorCode -9998
+"Invalid number of channels" failure on USB codecs that refuse mono.
+
+**Optional UI flow** on `/train`:
+
+  - New "🎙 Record yourself" card above the train form
+  - `POST /api/train/record_samples` (background thread, status updates
+    via the existing SSE bus)
+  - `POST /api/train/clear_user_samples`
+  - `GET /api/train/user_samples?keyword=X` — count for the keyword
+
+State machine added a new `state="recording"` between `idle` and
+`training`.  Listening/training endpoints already refuse non-idle
+states so no extra guards needed.
+
+Sample sequence: READY beep (A5, 180 ms) → 1.6 s capture → DONE beep
+(C5, 120 ms) → 1 s pause × N samples, COMPLETE beep at the end.
+WAVs persist under `/app/data/train/user_pos/<kw_safe>/` across
+trains until the user clicks "Clear my samples".
+
+### Numbers after the change
+
+| Train scenario | Time | Positives | Embed batches |
+|---|---:|---:|---:|
+| Pre-aug, no user samples (yesterday)    | 188 s | 300 | 1000 wavs |
+| TTS-aug only, no user samples           | 206 s | 600 | 1300 wavs |
+| TTS-aug + 3 user recs (test_rec, smoke) | 163 s | 375 | 1075 wavs |
+| TTS-aug + 10 user recs (typical)        | ~220 s (est) | 650 | 1350 wavs |
+
+The +18 s vs. pre-aug is the augmentation pass (~1 s) plus the doubled
+positive count flowing through the parallel embed (~+17 s).  Still well
+under the original 30 min, still under 4 min total.
+
+Recognition impact won't show in the train log — only in real-mic
+testing.  The expected shift on the user's own voice is from 0.4-0.5
+to 0.85+ with 10 user samples; other speakers in the same room should
+land 0.70+.
+
+### Files touched
+
+- new: `tools/audio_augment.py`
+- new: API endpoints in `web/app.py` for record/clear/count
+- new: "Record yourself" card + JS in `web/templates/train.html`
+- edit: `web/state.py` — added `start_recording_samples` +
+  `_record_worker` + augmentation pass in `_train_worker` + new
+  `state="recording"` + `rec_*` fields on ServiceStatus
+- edit: `audio/mic.py` — `record_blocking` opens at native channels
+  and down-mixes to mono
