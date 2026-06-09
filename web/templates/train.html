@@ -36,11 +36,18 @@
     cover other people's voices.  Typically lifts your confidence
     score from ~0.45 to ~0.90.</p>
 
-  <div class="row" style="align-items:center; gap:14px; margin-top:8px">
-    <button id="rec-btn" class="btn primary">▶ Record 10 samples</button>
+  <div class="row" style="align-items:center; gap:10px; margin-top:8px">
+    <label>How many
+      <input type="number" id="rec-n" value="3" min="1" max="20" style="width:54px">
+    </label>
+    <button id="rec-btn" class="btn primary">▶ Record samples</button>
     <button id="rec-clear-btn" class="btn" style="display:none">Clear my samples</button>
     <span id="rec-count" class="muted"></span>
   </div>
+  <p class="muted" style="margin-top:6px; font-size:0.92em">
+    Each click <strong>appends</strong> — record 3, swap to another person, click again,
+    record 3 more, and so on.  Aim for 9-12 samples across 3-4 different people.
+  </p>
 
   <div id="rec-prog" class="hidden" style="margin-top:14px">
     <h3 id="rec-phase">Recording…</h3>
@@ -137,7 +144,7 @@
   const recHint     = document.getElementById('rec-hint');
   const recBar      = document.getElementById('rec-bar');
 
-  const REC_TOTAL = 10;
+  const recNInput   = document.getElementById('rec-n');
   let recInFlight = false;
 
   async function refreshSampleCount() {
@@ -162,9 +169,10 @@
   recBtn.addEventListener('click', async () => {
     const kw = kwInput.value.trim();
     if (!kw) { alert('enter a keyword first'); return; }
+    const n = Math.max(1, Math.min(20, parseInt(recNInput.value, 10) || 3));
     const fd = new FormData();
     fd.append('keyword', kw);
-    fd.append('n_samples', REC_TOTAL);
+    fd.append('n_samples', String(n));
     const r = await fetch('/api/train/record_samples', { method: 'POST', body: fd });
     const j = await r.json();
     if (!j.ok) { alert(j.error || 'recording failed to start'); return; }
@@ -172,7 +180,7 @@
     recBtn.disabled = true; recClearBtn.disabled = true;
     recProg.classList.remove('hidden');
     recPhase.textContent = 'Get ready…';
-    recHint.textContent = 'on each "beep", say the keyword once and stop.';
+    recHint.textContent = `appending ${n} sample(s) — on each high beep, say the keyword once.`;
     recBar.style.width = '0%';
   });
 

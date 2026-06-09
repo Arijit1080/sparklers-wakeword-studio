@@ -260,3 +260,102 @@ land 0.70+.
   `state="recording"` + `rec_*` fields on ServiceStatus
 - edit: `audio/mic.py` — `record_blocking` opens at native channels
   and down-mixes to mono
+
+---
+
+## 2026-06-09  Tuning the precision/recall knob until it actually worked
+
+Yesterday's "TTS aug + optional user voice" shipped but in a real
+room with a real mic it failed in two opposite ways depending on the
+day:
+
+* prefix false-fire: trained "hey krishna", saying just "hey" lit it
+* under-confident: real-mic "hey krishna" scored 0.3-0.5 → missed
+
+Today was the messy debug arc that landed on settings that actually
+hold up.  No silver bullet — a half-dozen small dials, each pulling
+the boundary one way or the other.
+
+### What we tried, in order
+
+1. **Per-model threshold from the trained `suggested_threshold`.**
+   The model already picks an F1-optimal threshold during training; the
+   listener was ignoring it and using a single global.  Fixed the
+   listener to use the model's own value.  Helped slightly — but
+   `suggested_threshold` was landing at 0.10 because the eval set
+   separated trivially.  Added a floor (0.30, later 0.50) so a too-
+   low suggestion couldn't fire on phoneme noise.
+2. **Per-model UI override.**  Added per-model threshold inputs on the
+   home page with persistent storage in `_thresholds.json`.  User
+   asked us to tear it back out — "one threshold is enough."  Ripped.
+3. **Bumped hard-negative counts** — `N_HARD_PREFIX` 150 → 300, plus
+   the same augmentation pass on hardnegs as we'd been doing on
+   positives.  Stopped the prefix false-fire for a while, then it
+   came back as soon as we re-enabled user-voice training.
+4. **Threshold selection changed** from "lowest F1-tie" to "highest
+   F1-tie with eval precision ≥ 0.98".  Less aggressive thresholds.
+5. **Removed `class_weight="balanced"`.**  "Balanced" was upweighting
+   the (fewer) positives ~3×, tipping the boundary into negative
+   space and causing the "fires on random speech" failure.  Dropped to
+   `class_weight=None` with `C=0.5` for slightly more regularization.
+6. **Dropped the TTS-positive augmentation entirely.**  The aug copies
+   were expanding positive variety without an equivalent negative
+   expansion, widening the positive region.  Kept the negative
+   augmentation in place — net effect: "reverb + noise" carries no
+   class signal anymore.
+7. **User-voice pitch shifts: from ±4 → ±2 → none.**  Each step
+   helped a different failure mode and broke a different one.  ±4
+   garbled "krishna" past the embedding window → phantom "hey alone is
+   positive" examples.  ±2 was less destructive but still
+   over-emphasized the user's voice.  Zero pitch shifts meant the
+   model only fired on the trained speaker.
+8. **The actual answer for user-voice: `sample_weight=0.4`.**  Use
+   the recordings as-is (no pitch shifts, no aug copies) but weight
+   them at 40% in `clf.fit`.  10 user samples × 0.4 = 4 effective
+   positives against 300 TTS × 1.0 = 300.  User voice is ~1.3% of
+   the positive signal — enough to anchor real-mic acoustics for
+   hard-to-pronounce names, not enough to dominate the boundary.
+9. **Multi-person append-mode recording.**  The original record flow
+   wiped prior samples on every click.  Changed it to find the next
+   unused filename index and append, so 3-sample batches can stack:
+   person A → swap → person B → swap → person C → 9 samples covering
+   3 voices.  Added a "How many" input (default 3) to the UI.
+10. **Mic gain tuning.**  100% (+31 dB) on the Waveshare USB codec
+    looked like clipping when recording for training, so we dropped
+    to 50%.  Bad call — at 50% the live listening audio was so quiet
+    the embeddings landed nowhere near the trained positive region.
+    Bumped back to 100%; mild clipping at inference time is fine.
+
+### Other small simplifications
+
+- The home page threshold input default went 0.5 → 0.4 → 0.3 as we
+  iterated.  Final: 0.3.
+- Ripped per-model threshold storage, API endpoints, and UI controls.
+  One global threshold, no per-model magic, no floors or caps in the
+  listener — just `if score > threshold: fire`.
+- Listener logic simplified from "max of (global, floor, capped
+  suggestion)" to a single comparison.
+
+### Numbers
+
+Real-mic on a Jetson Orin Nano Super 8GB with the Waveshare USB
+codec mic, threshold 0.3, mic at 100% gain:
+
+| keyword type                   | real-mic score | "prefix alone" |
+|--------------------------------|---------------:|---------------:|
+| `hey krishna`, TTS-only        |       0.4-0.7  |       <0.10    |
+| `hey krishna`, +10 user voice  |       0.6-0.85 |       <0.15    |
+| `hey krishna`, +9 user (3 ppl) |       0.5-0.8  |       <0.10    |
+
+### Files touched today
+
+- edit: `web/state.py` — single-threshold listener, `class_weight=None`,
+  C=0.5, dropped positive-aug pass, kept hardneg-aug pass,
+  multi-person append recording, `sample_weight=0.4` for user-voice
+  rows, highest-F1-tie + precision-floor threshold selection
+- edit: `web/templates/home.html` — threshold default 0.3, removed
+  per-model controls
+- edit: `web/templates/train.html` — "How many" input, append mode
+  copy, hint about multi-person batches
+- removed: per-model threshold API + UI + persistence (was added and
+  then yanked in the same day per user feedback)

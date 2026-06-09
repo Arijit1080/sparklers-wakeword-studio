@@ -318,6 +318,8 @@ class WakewordService:
                     top_key, top_val = "", -1.0
                     for k, v in all_scores.items():
                         if v > top_val: top_key, top_val = k, v
+                        # One knob: the dashboard threshold applies to
+                        # every model.  User tunes it themselves.
                         if v > threshold:
                             streak[k] = streak.get(k, 0) + 1
                         else:
@@ -443,12 +445,26 @@ class WakewordService:
                        "n_samples": n_samples})
             out_dir = self._user_pos_dir(kw_safe)
             out_dir.mkdir(parents=True, exist_ok=True)
-            # wipe any prior recordings for this keyword so the saved set
-            # always matches what just got captured
-            for p in list(out_dir.glob("*.wav")):
-                p.unlink()
+            # APPEND mode — find the next unused index so the user can
+            # record one batch per person (e.g. 3 samples), let the
+            # next speaker take the mic, click "Record more", and have
+            # their samples added to the same set without wiping.  The
+            # "Clear my samples" button is the only thing that wipes.
+            existing = sorted(out_dir.glob("sample_*.wav"))
+            start_idx = 0
+            for p in existing:
+                try:
+                    n = int(p.stem.split("_")[-1])
+                    if n + 1 > start_idx:
+                        start_idx = n + 1
+                except ValueError:
+                    continue
+            total_after = start_idx + n_samples
+            self._push_status(rec_done=start_idx, rec_total=total_after,
+                               rec_keyword=keyword, rec_status="ready")
 
-            for i in range(n_samples):
+            for k in range(n_samples):
+                i = start_idx + k
                 if self._stop.is_set():
                     self._push_status(rec_status="cancelled")
                     self.emit({"type": "record_cancel"})
@@ -490,10 +506,12 @@ class WakewordService:
             except Exception:
                 pass
             self._push_status(
-                state="idle", rec_status="done", rec_done=n_samples,
+                state="idle", rec_status="done",
+                rec_done=total_after, rec_total=total_after,
             )
             self.emit({"type": "record_done", "keyword": keyword,
-                       "count": n_samples})
+                       "count": total_after,
+                       "added": n_samples})
         except Exception as e:    # noqa: BLE001
             print(f"[record] fatal: {e}", flush=True)
             self._push_status(state="idle",
@@ -575,8 +593,12 @@ class WakewordService:
             #     (positives + multi-word hard negatives).
             N_SILENCE = 200
             N_NOISY = 200
-            N_HARD_SUFFIX = 150
-            N_HARD_PREFIX = 150
+            # Hard-negs are weighted asymmetrically: prefix-only false-
+            # fires are the worst UX failure (a user saying "hey" all
+            # day shouldn't trip "hey krishna"), so we generate ~2× more
+            # prefix-only than suffix-only hard negatives.
+            N_HARD_SUFFIX = 200
+            N_HARD_PREFIX = 300
             voices = sorted([p.stem for p in VOICES_DIR.glob("*.onnx")])
             from tools.generate_samples import (
                 _load_voice, _synthesize, _pad_or_crop_centered, _save_wav,
@@ -762,63 +784,48 @@ class WakewordService:
                 noisy_mixed[i] = mixed
                 _save_wav(mixed, NEG_DIR / f"_noisy_{i:04d}.wav")
 
-            # --- augment the TTS positives ---
-            # For every clean Piper positive we produce one augmented
-            # copy with random reverb + light noise + small pitch jitter.
-            # This drags the positive-class decision boundary toward
-            # "real-mic-in-a-real-room" so the classifier doesn't fire
-            # only on studio-clean TTS.  Each aug is fast (~ms) so the
-            # whole pass is dominated by disk I/O.
+            # --- augment NEGATIVES only ---
+            # We previously augmented positives too, but that doubled
+            # the "positive variety" without a matching expansion on the
+            # negative side, widening the positive decision region until
+            # the classifier fired on random speech.  Negative-only aug
+            # keeps the positives tight (the user's real-room samples
+            # + TTS diversity already cover them) while teaching the
+            # classifier that reverb/noise on speech is NEUTRAL — could
+            # be either class.
             from tools.audio_augment import augment_positive
             t_aug0 = _time.perf_counter()
-            tts_pos_wavs = sorted(POS_DIR.glob("*.wav"))
-            n_tts_aug = 0
-            for p in tts_pos_wavs:
-                # skip anything that's already an aug copy (shouldn't be
-                # any at this point, but be defensive across retrains)
-                if "_aug" in p.stem or "_user" in p.stem:
-                    continue
+            n_tts_aug = 0  # no positive aug now
+            hardneg_wavs = (sorted(NEG_DIR.glob("_hardneg_sfx_*.wav"))
+                            + sorted(NEG_DIR.glob("_hardneg_pfx_*.wav")))
+            n_neg_aug = 0
+            for p in hardneg_wavs:
                 clip = load_wav(str(p)).samples
                 aug = augment_positive(clip, rng)
-                # the aug step may have changed clip length (pitch jitter)
                 aug = _pad_or_crop_centered(aug)
-                _save_wav(aug, POS_DIR / f"{p.stem}_aug.wav")
-                n_tts_aug += 1
+                _save_wav(aug, NEG_DIR / f"{p.stem}_aug.wav")
+                n_neg_aug += 1
 
-            # --- load user-recorded positives if any, pitch-shift ---
-            # Persisted at /app/data/train/user_pos/<kw_safe>/sample_NN.wav
-            # from the optional "Record yourself" flow.  Each sample
-            # turns into 5 augmented variants ({-4,-2,0,+2,+4} semitones)
-            # — synthetic speaker diversity from a single recording set.
+            # --- load user-recorded positives, MINIMAL footprint ---
+            # No pitch shifts, no aug copies — each recording saved
+            # exactly once.  The actual user influence is controlled
+            # downstream via sample_weight (0.4 vs 1.0 for TTS), so
+            # 10 user recordings contribute only ~1.3% of the positive
+            # training signal.  This is enough to anchor real-mic
+            # acoustics for hard-to-pronounce names without pulling
+            # the decision boundary toward the user's specific voice.
             USER_POS_DIR = ROOT / "data" / "train" / "user_pos" / kw_safe
             user_paths = sorted(USER_POS_DIR.glob("*.wav")) \
                 if USER_POS_DIR.exists() else []
-            n_user_aug = 0
-            if user_paths:
-                from tools.audio_augment import pitch_shift
-                pitch_variants = [-4.0, -2.0, 0.0, +2.0, +4.0]
-                for ui, p in enumerate(user_paths):
-                    clip = load_wav(str(p)).samples
-                    for psh in pitch_variants:
-                        shifted = pitch_shift(clip, psh) \
-                            if abs(psh) > 0.01 else clip
-                        # also apply mild reverb/noise so user samples
-                        # cover position-in-room variation
-                        shifted = augment_positive(
-                            shifted, rng,
-                            pitch_semitones=0.0,  # already pitch-shifted
-                            pitch_jitter_prob=0.0,
-                            reverb_prob=0.5, noise_prob=0.5,
-                        )
-                        shifted = _pad_or_crop_centered(shifted)
-                        _save_wav(
-                            shifted,
-                            POS_DIR / f"_user_{ui:02d}_p{int(psh):+d}.wav",
-                        )
-                        n_user_aug += 1
-            print(f"[train] augmented positives: "
-                  f"+{n_tts_aug} TTS-aug, +{n_user_aug} user "
-                  f"({len(user_paths)} recordings × 5 pitch variants) "
+            n_user = 0
+            for ui, p in enumerate(user_paths):
+                clip = load_wav(str(p)).samples
+                clean = _pad_or_crop_centered(clip)
+                _save_wav(clean, POS_DIR / f"_user_{ui:02d}_orig.wav")
+                n_user += 1
+            print(f"[train] augmentation pass: "
+                  f"+{n_tts_aug} TTS-pos-aug, +{n_neg_aug} hardneg-aug, "
+                  f"+{n_user} user (down-weighted 0.4x in fit) "
                   f"in {_time.perf_counter() - t_aug0:.1f}s",
                   flush=True)
 
@@ -944,33 +951,81 @@ class WakewordService:
             X = np.vstack([Xp, Xn])
             y = np.concatenate([np.ones(len(Xp), dtype=np.int8),
                                  np.zeros(len(Xn), dtype=np.int8)])
+            # Build per-row training weight.  TTS positives + all
+            # negatives get 1.0.  User-recorded positives (filenames
+            # start with "_user_") get 0.4 so they nudge the boundary
+            # toward real-mic acoustics without dominating it.  Without
+            # this down-weighting, the user's specific voice swallows
+            # the boundary and the model "only fires on me, not others".
+            USER_WEIGHT = 0.4
+            sw_pos = np.array([
+                USER_WEIGHT if p.name.startswith("_user_") else 1.0
+                for p in pos_wavs
+            ], dtype=np.float32)
+            sw_neg = np.ones(len(Xn), dtype=np.float32)
+            sample_weight = np.concatenate([sw_pos, sw_neg])
+
             rng = np.random.default_rng(42)
             idx = rng.permutation(len(X))
             X, y = X[idx], y[idx]
+            sample_weight = sample_weight[idx]
             n_eval = max(20, int(len(X) * 0.10))
             X_eval, y_eval = X[:n_eval], y[:n_eval]
             X_train, y_train = X[n_eval:], y[n_eval:]
+            sw_train = sample_weight[n_eval:]
             from sklearn.linear_model import LogisticRegression
             from sklearn.pipeline import Pipeline
             from sklearn.preprocessing import StandardScaler
-            from sklearn.metrics import roc_auc_score, f1_score
+            from sklearn.metrics import (
+                roc_auc_score, f1_score, precision_score,
+            )
+            # class_weight=None (not "balanced"): "balanced" upweights
+            # positives by ~3× because there are fewer of them, which
+            # tips the decision boundary into negative space and makes
+            # the model fire on random speech.  Equal weighting +
+            # mild regularization lets LR find a tighter boundary
+            # that scores random words near 0 instead of 0.3-0.5.
             clf = Pipeline([
                 ("scaler", StandardScaler()),
                 ("logreg", LogisticRegression(
-                    C=1.0, class_weight="balanced",
+                    C=0.5,
                     max_iter=2000, random_state=42,
                     solver="lbfgs",
                 )),
             ])
-            clf.fit(X_train, y_train)
+            clf.fit(X_train, y_train,
+                    **{"logreg__sample_weight": sw_train})
             p_eval = clf.predict_proba(X_eval)[:, 1]
             auc = float(roc_auc_score(y_eval, p_eval))
-            best_t, best_f1 = 0.5, 0.0
-            for t in np.arange(0.1, 0.95, 0.05):
-                f = f1_score(y_eval, (p_eval > t).astype(np.int8),
-                              zero_division=0)
-                if f > best_f1:
+
+            # Pick the F1-best threshold, but among ties take the
+            # HIGHEST — for a well-separated classifier F1 plateaus
+            # across a wide threshold range and the old "first tie"
+            # pick landed at 0.10, way too sensitive at runtime.  We
+            # also require precision >= 0.98 on the eval slice so a
+            # single eval-set false-positive doesn't silently pull
+            # the threshold down into noise territory.
+            best_t, best_f1 = 0.5, -1.0
+            for t in np.arange(0.10, 0.96, 0.05):
+                pred = (p_eval > t).astype(np.int8)
+                f = f1_score(y_eval, pred, zero_division=0)
+                prec = (precision_score(y_eval, pred, zero_division=0)
+                        if pred.sum() > 0 else 1.0)
+                if prec < 0.98:
+                    continue
+                # >= so ties prefer the LATER (higher) threshold
+                if f >= best_f1:
                     best_t, best_f1 = float(t), float(f)
+            # If nothing met the precision floor (eval has unlucky
+            # false positives), fall back to plain F1-best, but
+            # still prefer the higher tie.
+            if best_f1 < 0.0:
+                best_t, best_f1 = 0.5, -1.0
+                for t in np.arange(0.10, 0.96, 0.05):
+                    f = f1_score(y_eval, (p_eval > t).astype(np.int8),
+                                  zero_division=0)
+                    if f >= best_f1:
+                        best_t, best_f1 = float(t), float(f)
 
             # ----- 5. save -----
             self._push_status(train_phase="save",

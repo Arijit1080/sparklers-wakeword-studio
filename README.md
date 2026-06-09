@@ -14,7 +14,7 @@ Built on top of [OpenWakeWord](https://github.com/dscripka/openWakeWord)'s share
 
 - **One-click custom wake words** — type the phrase in the web UI, ~3 min later you have a trained model
 - **Speaker-independent** — generates ~1300 synthetic training samples across 6 different Piper TTS voices + room/mic augmentation (reverb, noise mix, pitch jitter) so the model generalizes across speakers and rooms
-- **Optional "record yourself" flow** — capture 10 short clips of your voice through the same mic you'll be using, the trainer pitch-shifts them ±2/±4 semitones for synthetic speaker diversity, mixes them into the positives. Typically lifts real-mic confidence from ~0.45 to ~0.90 without locking the model to a single speaker
+- **Optional multi-person "record yourself" flow** — append a few clips at a time so you can swap speakers between batches (e.g. 3 samples per person × 3-4 people). User recordings are mixed into training with a 0.4× sample weight so they anchor the model on real-mic acoustics without dominating the decision boundary — keeps the model speaker-independent while improving recognition for hard-to-pronounce names where TTS gets it wrong
 - **Fast training** — pre-baked keyword-independent negatives (built once at Docker build time) + per-voice parallel Piper synth + parallel ONNX feature extraction. ~3 min per keyword on Jetson Orin Nano Super, **10× faster than the original ~30 min pipeline**
 - **Multi-word phrase handling** — for keywords like "Hey Krishna", automatically generates suffix-only ("krishna") and prefix-only ("hey", "hey there") hard negatives so partial phrases don't false-fire
 - **Silence + noise robust** — training set includes 200 pure-silence and 200 noisy-distractor samples so ambient room audio stays well below threshold
@@ -197,13 +197,21 @@ Now it survives reboots and you can manage it like any other Linux service.
 
 ![home](docs/images/home.png)
 
-### 1. (Optional but strongly recommended) Record yourself
+### 1. (Optional) Multi-person record yourself
 
-Above the train form there's a **🎙 Record yourself** card. Type your keyword, click **▶ Record 10 samples**, then on each high beep say the keyword once and stop — wait for the low beep, pause, repeat. ~30 seconds total. The clips are saved per-keyword and persist across retrains until you click **Clear my samples**.
+Above the train form there's a **🎙 Record yourself** card. Type your keyword, pick **How many** (default 3), click **▶ Record samples**. On each high beep say the keyword once and stop — wait for the low beep, pause, then the next beep. The arpeggio at the end means the batch is done.
 
-Why bother? The TTS voices are studio-clean; your room and mic are not. Recording 10 short clips of *your* actual voice through *your* actual mic gives the classifier ground truth for the acoustic conditions it'll be running in. The trainer pitch-shifts each of your samples to {-4, -2, 0, +2, +4} semitones so 10 recordings become 50 augmented positives covering a wide fundamental-frequency range — your voice gets the highest confidence (typically 0.85-0.95), but other people in the same room are still detected reliably (~0.70-0.80).
+Each click **appends** to the existing set with the next available filename index. Sequence for multi-person coverage:
 
-If you skip this step, the trainer falls back to TTS-only positives (still augmented with reverb/noise) — works, just with somewhat under-confident scores on real human voice.
+1. Click → person A records 3 → swap mic
+2. Click → person B records 3 → swap
+3. Click → person C records 3
+4. (Optional) Click → record 1-3 more in noisier conditions / different distances
+5. The counter shows the running total (`✓ N samples saved for "your keyword"`)
+
+Why bother? For names TTS can't pronounce well (non-English names, brand names, slang), the synthetic positives don't match what the keyword actually sounds like. A handful of real recordings plant ground-truth anchors in the real-mic embedding region. Multiple speakers across batches teaches the model your room's acoustics without locking it to one voice.
+
+**Influence is intentionally small.** Each user sample carries a 0.4× weight in training vs 1.0× for TTS, so 12 user samples = 4.8 effective positives against 300 TTS = ~1.6% of the positive signal. Enough to anchor real-mic acoustics; not enough to drag the boundary toward any one speaker. Skip the whole step if TTS already pronounces your keyword correctly.
 
 ### 2. Train a new keyword
 
@@ -246,15 +254,16 @@ These are the values that gave reliable triggering with minimal false positives 
 
 | Setting | Value | Why |
 |---|---|---|
-| **Threshold** | **0.3** | The classifier's sklearn output is well-calibrated against silence (which scores ~0) and non-keyword speech (~0.1–0.2), so 0.3 is a comfortable margin above noise and below true positives |
+| **Threshold** | **0.3** | Single global threshold applied to every selected model. The trained classifier scores silence ~0 and non-keyword speech ~0.1, so 0.3 is a comfortable margin above noise and below true positives |
 | **Patience** | **1** | Single above-threshold frame fires immediately. Higher values delay the trigger by 80 ms each — only useful if you're seeing brief 1-frame spikes from glitches |
 | **VAD threshold** | **0.3** | Built into OpenWakeWord — skips scoring on silent windows. Has minimal effect when our energy-gate is also on (which it always is for sklearn models) |
 | **Cooldown** | **2 s** | Suppresses repeat triggers from sustained utterances. Long enough to feel responsive, short enough not to miss the next intended trigger |
+| **Mic gain** | **100% (~+31 dB)** on a USB codec | Set once via `amixer -c 0 sset 'Mic' 100% && sudo alsactl store 0`. Lower gain (50-70%) gives quiet live embeddings that fall outside the trained positive class region → scores never reach the firing threshold. 100% is loud but the classifier is robust to mild clipping at inference time |
 | **Energy gate** (built-in, not user-tunable) | **-42 dBFS** over the 1.28 s window | Skips classifier entirely on silence, prevents false positives from ambient room noise |
 
-If your keyword still misses: drop threshold to 0.25 or retrain with `positives per voice = 100` (default 50) for more positive variation.
+If your keyword still misses: drop threshold to 0.25 manually before clicking Start, or retrain with `positives per voice = 100` (default 50) for more positive variation, or use the optional multi-person record-yourself flow.
 
-If your keyword false-fires: raise threshold to 0.4 or set patience to 2, OR retrain — the prefix/suffix hard-negative pipeline assumes a 2-word keyword. For 3+ word keywords you may want to extend it.
+If your keyword false-fires: raise threshold to 0.35-0.4 OR retrain — the prefix/suffix hard-negative pipeline assumes a 2-word keyword. For 3+ word keywords you may want to extend it.
 
 ---
 
@@ -279,13 +288,16 @@ If your keyword false-fires: raise threshold to 0.4 or set patience to 2, OR ret
      From pre-baked cache (no synth):
        ├─ 480 voice-distractor FEATURES (already embedded)
        └─ 200 noisy distractor base WAVs (mixed with per-run noise here)
-     Augmentation pass (each clean TTS positive → one extra copy):
-       ├─ random reverb (synthetic small-room IR)
-       ├─ random light noise (15-28 dB SNR)
-       └─ random pitch jitter (±1.5 semitones)
+     Augmentation pass on HARD-NEGATIVES only (not positives):
+       └─ each suffix/prefix hardneg → one extra copy with random
+          reverb + light noise + small pitch jitter, so "real-room-
+          sounding speech" doesn't accidentally signal positive class
      IF user recordings exist (data/train/user_pos/<kw_safe>/*.wav):
-       └─ each sample → 5 pitch-shifted variants (-4,-2,0,+2,+4 semitones)
-                       + small reverb + light noise
+       └─ each sample saved as-is, no pitch shifts, no aug copies.
+          Down-weighted to 0.4x in the sklearn fit (via sample_weight)
+          so ~10 user samples carry the influence of ~4 effective
+          positives against the 300 TTS positives — anchors real-mic
+          acoustics without dragging the boundary toward one speaker.
        ↓
    5 parallel embed workers, each running:
      OpenWakeWord shared backbone (pretrained, ONNX):
